@@ -41,16 +41,13 @@ class Lut:
         values = np.asarray(values, dtype=np.float64)
         missing = np.isnan(values)
         filled = np.where(missing, self._v[0], values)
-        out = np.rint(np.interp(filled, self._v, self._b)).astype(np.uint8)
-        out[missing] = MISSING
-        return out
+        # np.where keeps single values working too (np.interp returns a scalar for them).
+        return np.where(missing, MISSING, np.rint(np.interp(filled, self._v, self._b))).astype(np.uint8)
 
     def decode(self, data) -> np.ndarray:
         """Values for bytes [data]; MISSING becomes NaN."""
         data = np.asarray(data)
-        out = np.interp(data.astype(np.float64), self._b, self._v)
-        out[data == MISSING] = np.nan
-        return out
+        return np.where(data == MISSING, np.nan, np.interp(data.astype(np.float64), self._b, self._v))
 
     def step(self, value: float) -> float:
         """The value change per byte around [value]: the larger step of the segments that touch it."""

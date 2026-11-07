@@ -29,6 +29,14 @@ def test_missing_and_clipping():
     assert np.isnan(lut.decode([MISSING])[0])
 
 
+def test_single_values_work_like_arrays():
+    lut = Lut([(0, 0.0), (254, 100.0)])
+    assert int(lut.encode(50.0)) == 127
+    assert int(lut.encode(np.nan)) == MISSING
+    assert float(lut.decode(np.uint8(127))) == pytest.approx(50.0, abs=0.2)
+    assert np.isnan(float(lut.decode(np.uint8(MISSING))))
+
+
 def test_bad_breakpoints_are_refused():
     for bad in ([(0, 0.0)], [(1, 0.0), (254, 1.0)], [(0, 1.0), (254, 0.0)], [(0, 0.0), (255, 1.0)]):
         with pytest.raises(ValueError):
