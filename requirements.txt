@@ -1,0 +1,4 @@
+numpy==2.5.4
+eccodes==2.50.0
+# On Linux the eccodes package is pure Python; the ecCodes library comes from eccodeslib.
+eccodeslib==2.50.0.34; sys_platform == "linux"

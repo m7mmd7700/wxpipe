@@ -1,0 +1,105 @@
+name: publish
+
+on:
+  schedule:
+    # Hourly, off the top of the hour: GitHub delays or drops scheduled runs at :00 under load.
+    # When there is no new complete GFS run, only the first two steps run.
+    - cron: "17 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # the weekly heartbeat commit that keeps the schedule enabled
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      published: ${{ steps.run.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Standard library only, on the runner's own Python. The URL comes from environment variables,
+      # which every trigger sets (the schedule event payload has no repository object).
+      - name: Is there a new GFS run?
+        id: check
+        run: python3 -m wxpipe.check --manifest "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/manifest.json"
+
+      - uses: actions/setup-python@v7
+        if: steps.check.outputs.new == 'true'
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        if: steps.check.outputs.new == 'true'
+        run: pip install -r requirements.txt pytest==9.1.1
+
+      - name: Check the ecCodes library
+        if: steps.check.outputs.new == 'true'
+        run: python -c "import eccodes; print('ecCodes', eccodes.codes_get_api_version())"
+
+      - name: Unit tests
+        if: steps.check.outputs.new == 'true'
+        run: python -m pytest -q
+
+      - name: Restore the site of the last run
+        if: steps.check.outputs.new == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: site
+          key: site-${{ github.run_id }}
+          restore-keys: site-
+
+      - name: Build the new GFS run
+        id: run
+        if: steps.check.outputs.new == 'true'
+        run: python -m wxpipe.run --out site --work work --cycle "${{ steps.check.outputs.cycle }}"
+
+      - name: Upload the site
+        if: steps.run.outputs.published == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Keep the site for the next run
+        if: steps.run.outputs.published == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: site
+          key: site-${{ github.run_id }}
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  heartbeat:
+    # Scheduled workflows in a public repository stop after 60 days without repository activity.
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Commit a heartbeat at most once a week
+        run: |
+          last=$(cat heartbeat.txt 2>/dev/null || echo 1970-01-01)
+          if [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -gt 604800 ]; then
+            date -u +%Y-%m-%d > heartbeat.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat.txt
+            git commit -m "Heartbeat: keep the hourly schedule enabled"
+            git push
+          fi

@@ -1,0 +1,10 @@
+[project]
+name = "wxpipe"
+version = "0.1.0"
+description = "Turns NOAA GFS forecasts into static map tiles for a personal weather app"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.0", "eccodes>=2.38"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
