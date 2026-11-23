@@ -68,7 +68,8 @@ Tile (i, j) spans columns i·W to i·W + W and rows j·H to j·H + H, ends inclu
 ## Files
 
 - `manifest.json`: for each source, its current release under `sources` and its previous one under `previous`, with the frame times, levels, region, fields and their tables. `previous` is left out when no source has one.
-- `<source>/<release>/<field>/<WxH-step>/<i>-<j>.wxt`, such as `gfs/2026110712/...`: one WXT1 file per tile and field, holding every frame (`wxpipe/wxt.py`). Each frame is a separate zlib stream at an offset listed in the header, so the app can read the whole file or single frames with HTTP Range requests (GitHub Pages answers 206). A GFS release has 648 files.
+- `<source>/<release>/<field>/<WxH-step>/<i>-<j>.wxt`, such as `gfs/2026110712/...`: one WXT1 file per tile and field, holding every frame (`wxpipe/wxt.py`). Each frame is a separate zlib-format stream at an offset listed in the header, so the app can read the whole file or single frames with HTTP Range requests (GitHub Pages answers 206). A GFS release has 648 files.
+- The frames are written by libdeflate at level 12, through the `deflate` package. Its zlib-format streams inflate with any zlib inflater, so the header's `"format": "zlib"` and the app are unchanged. On the 9-frame release of the 2026-11-07 12z run, they are 3.52% smaller than zlib level 9, and take 3.80 times as long to encode. The encode time on the runner is not measured: scaled from this computer, about 80 s for 209 frames.
 - `status.json`: written by the size gate, below.
 
 ### The manifest merge and pruning

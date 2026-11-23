@@ -4,12 +4,16 @@ Layout, little-endian:
     magic   b"WXT1"            4 bytes
     hlen    uint32             length of the JSON header
     header  UTF-8 JSON         grid, values (LUT), frames index, ...
-    frames  zlib streams       one per frame, at the offsets in the index
+    frames  zlib-format streams, one per frame, at the offsets in the index
 
-Each frame is ny * nx uint8 values, row-major from north to south, compressed on its own with zlib,
-so a client can fetch the whole file or any single frame with a Range request (GitHub Pages answers
-206). header["frames"] is a list of [valid_time_epoch_s, offset, length], offsets counted from the
-first byte after the header.
+Each frame is ny * nx uint8 values, row-major from north to south, compressed on its own into a
+zlib-format stream, so a client can fetch the whole file or any single frame with a Range request
+(GitHub Pages answers 206). header["frames"] is a list of [valid_time_epoch_s, offset, length],
+offsets counted from the first byte after the header.
+
+The streams are written by libdeflate at level 12 (the `deflate` package), smaller than zlib's level 9
+and in the same zlib format, so header["format"] stays "zlib" and any zlib inflater reads them: the
+app's Inflater, and Python's zlib in `decode` below.
 """
 
 from __future__ import annotations
@@ -19,13 +23,15 @@ import struct
 import zlib
 from pathlib import Path
 
+import deflate
 import numpy as np
 
 MAGIC = b"WXT1"
+LEVEL = 12   # libdeflate's highest level
 
 
-def encode(header: dict, frames: list[tuple[int, np.ndarray]], level: int = 9) -> bytes:
-    payloads = [zlib.compress(np.ascontiguousarray(grid, dtype=np.uint8).tobytes(), level) for _, grid in frames]
+def encode(header: dict, frames: list[tuple[int, np.ndarray]]) -> bytes:
+    payloads = [deflate.zlib_compress(np.ascontiguousarray(grid, dtype=np.uint8).tobytes(), LEVEL) for _, grid in frames]
     index, offset = [], 0
     for (t, _), payload in zip(frames, payloads):
         index.append([int(t), offset, len(payload)])

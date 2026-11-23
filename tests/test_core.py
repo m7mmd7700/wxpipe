@@ -94,6 +94,72 @@ def test_wxt_round_trip_and_frame_index():
     assert all(o2 == o1 + n1 for (o1, n1), (o2, _) in zip(offsets, offsets[1:]))
 
 
+def mixed_frames():
+    """Frames like real fields (smooth, banded, constant with missing bytes) and one of noise."""
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[0:61, 0:61]
+    smooth = (127 + 100 * np.sin(x / 9.0) * np.cos(y / 7.0)).astype(np.uint8)
+    banded = ((x // 4 + y // 6) % 255).astype(np.uint8)
+    flat = np.full((61, 61), 254, dtype=np.uint8)
+    flat[20:30, 5:50] = MISSING
+    noise = rng.integers(0, 256, (61, 61), dtype=np.uint8)
+    return [(1_794_052_800 + 3600 * k, grid) for k, grid in enumerate((smooth, banded, flat, noise, smooth[::-1]))]
+
+
+def split(data: bytes) -> tuple[dict, list[bytes]]:
+    import json
+    import struct
+
+    (hlen,) = struct.unpack("<I", data[4:8])
+    header = json.loads(data[8:8 + hlen].decode("utf-8"))
+    base = 8 + hlen
+    return header, [data[base + o: base + o + n] for _, o, n in header["frames"]]
+
+
+def test_frames_inflate_with_zlib_to_the_same_bytes():
+    import zlib
+
+    frames = mixed_frames()
+    header, streams = split(wxt.encode({"grid": {"nx": 61, "ny": 61}, "data": "x"}, frames))
+    assert len(streams) == len(frames) == 5
+    for (_, grid), stream in zip(frames, streams):
+        assert zlib.decompress(stream) == grid.tobytes()
+    assert sum(n for _, _, n in header["frames"]) == sum(map(len, streams))
+
+
+def test_the_header_is_zlib_9s_but_for_the_frames_offsets_and_lengths():
+    import json
+    import zlib
+
+    frames = mixed_frames()
+    tile = {"source": "gfs", "release": "2026110712", "data": "x", "units": "C",
+            "grid": {"level": "60x60/1", "i": 1, "j": 3, "grid": [60, 120, 180, 240], "steps": [1, 1], "nx": 61, "ny": 61},
+            "values": {"scale": "lin", "breakpoints": [[0, 0.0], [254, 100.0]], "missing": 255}}
+    # The header zlib level 9 gave before, built by the old rule.
+    old_index, offset = [], 0
+    for t, grid in frames:
+        n = len(zlib.compress(grid.tobytes(), 9))
+        old_index.append([t, offset, n])
+        offset += n
+    old = dict(tile, wxt=1, format="zlib", frames=old_index)
+
+    new, _ = split(wxt.encode(tile, frames))
+    assert list(new) == list(old)
+    assert {k: v for k, v in new.items() if k != "frames"} == {k: v for k, v in old.items() if k != "frames"}
+    assert new["wxt"] == 1 and new["format"] == "zlib"
+    assert [t for t, _, _ in new["frames"]] == [t for t, _, _ in old["frames"]]
+    assert [n for _, _, n in new["frames"]] != [n for _, _, n in old["frames"]]
+
+
+def test_the_frames_are_libdeflates_level_12():
+    import deflate
+
+    frames = mixed_frames()
+    _, streams = split(wxt.encode({"grid": {"nx": 61, "ny": 61}, "data": "x"}, frames))
+    for (_, grid), stream in zip(frames, streams):
+        assert stream == deflate.zlib_compress(grid.tobytes(), 12)
+
+
 # ---- GFS index files ------------------------------------------------------------------------
 
 def records(fhour: int):
