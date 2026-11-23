@@ -201,6 +201,10 @@ def build_precip(src: config.Source, field, cycle, hours, idx, fetcher, method: 
             grid = np.full((config.NY, config.NX), np.nan)
         frames.append((valid_time(cycle, h), field.lut.encode(grid)))
         prev_h, prev_w = h, now_w
+    # Frame 0 has no interval of its own: it takes the first interval's rate, for every source. With a
+    # single hour there is no interval, and frame 0 stays missing.
+    if len(frames) > 1:
+        frames[0] = (frames[0][0], frames[1][1].copy())
     return frames
 
 

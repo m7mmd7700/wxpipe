@@ -51,7 +51,7 @@ The mirror answers "503 SlowDown" often. Fetching the sample of run 2026112312 t
 
 **The download cache.** Every index and message is written to `<name>.part` in its folder and then renamed onto its name, so a killed run never leaves a short file under the final name. A cached message is reused only when its size is its record's length, when the index gives one; otherwise it is read again. A cached index that does not parse is deleted and read once more.
 
-The workflow keeps `work/ifs` in the Actions cache. It is restored before the build only in a run that builds `ifs` and not GFS, since a run that builds GFS defers `ifs`; it is saved after the build, also after a failed build, whenever it holds a file, and a failed save never stops the gate or the upload. Both use the key `ifs-work-<run id>-<run attempt>`, restored from the newest `ifs-work-` entry. At an IFS job's start, `wxpipe.run` deletes every cycle folder under `work/ifs/` but the one it builds, so the cache holds one run.
+The workflow keeps `work/ifs` in the Actions cache. It is restored before the build only in a run that builds `ifs` and not GFS, since a run that builds GFS defers `ifs`; it is saved after the build, also after a failed build, whenever it holds a file, and a failed save never stops the gate or the upload. Both use the key `ifs-work-<run id>-<run attempt>`, restored from the newest `ifs-work-` entry. When GFS is in a run's build list but its job is skipped, `ifs` then builds in that run without its cache restored, reading from the mirror again, and its files are saved for later. At an IFS job's start, `wxpipe.run` deletes every cycle folder under `work/ifs/` but the one it builds, so the cache holds one run.
 
 ### The probe
 
@@ -94,7 +94,7 @@ The app must treat byte 255 as missing (blueprint B2): its LUT maps 255 to "disc
 
 ### Precipitation rate
 
-GFS stores APCP two ways: the total since the run started, and a bucket that restarts every 6 hours. The rate over (previous frame, frame] uses the bucket when it covers the previous frame, and the difference of two buckets otherwise (`wxpipe/precip.py`). This was measured on the 2026-11-07 12z run:
+GFS stores APCP two ways: the total since the run started, and a bucket that restarts every 6 hours. The rate over (previous frame, frame] uses the bucket when it covers the previous frame, and the difference of two buckets otherwise (`wxpipe/precip.py`). Frame 0, the run's first hour, has no interval of its own, so it takes the first interval's rate, the same values as frame 1, for every source; only a release of a single hour, which has no interval, leaves frame 0 missing. This was measured on the 2026-11-07 12z run:
 
 | Interval | Negative cells: bucket / since-start | Largest difference between methods |
 |---|---|---|

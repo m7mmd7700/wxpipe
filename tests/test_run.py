@@ -982,6 +982,62 @@ def test_a_rerun_replaces_its_folder_and_a_stale_stage_is_removed(no_requests, m
     assert not (work / "stage" / "gfs" / f"{CYCLE}.old").exists()
 
 
+# ---- round 2: frame 0 of the precipitation rate -----------------------------------------------------
+
+class KeyedFetcher:
+    """Hands each record's message as its own key, `<hour>:<number>`, for a decode that maps it to a value."""
+
+    def messages(self, items):
+        return {(h, r.number): f"{h}:{r.number}".encode() for h, r in items}
+
+
+def precip_frames(monkeypatch, src, hours, idx, totals: dict) -> tuple[list, dict]:
+    """build_precip with a fake decode: the record of (hour, window) holds the constant totals[(hour, window)],
+    in the source's own units."""
+    field = src.field("precipitation.sfc")
+    values = {}
+    for h in hours:
+        for window, r in src.accumulation_records(idx[h], field.grib, h).items():
+            values[f"{h}:{r.number}".encode()] = totals[(h, window)]
+    monkeypatch.setattr(grib, "decode", lambda message, s: np.full((config.NY, config.NX), values[message]))
+    report: dict = {}
+    frames = run.build_precip(src, field, run.parse_cycle(CYCLE), hours, idx, KeyedFetcher(), "bucket", report)
+    return frames, report
+
+
+def test_frame_zero_takes_the_first_intervals_rate_for_gfs(monkeypatch):
+    # A23, GFS-like: 12 mm by hour 6, a 3 mm bucket over 6 to 7 h.
+    hours = (0, 6, 7)
+    totals = {(6, (0, 6)): 12.0, (7, (6, 7)): 3.0, (7, (0, 7)): 15.0}
+    frames, report = precip_frames(monkeypatch, config.GFS, hours, index(hours), totals)
+    lut = config.GFS.field("precipitation.sfc").lut
+    assert [t for t, _ in frames] == [run.valid_time(run.parse_cycle(CYCLE), h) for h in hours]
+    assert np.array_equal(frames[0][1], frames[1][1])
+    assert np.allclose(lut.decode(frames[0][1]), 2.0, atol=lut.step(2.0) / 2)
+    assert np.allclose(lut.decode(frames[2][1]), 3.0, atol=lut.step(3.0) / 2)
+    assert [e["interval"] for e in report["intervals"]] == [[0, 6], [6, 7]]
+
+
+def test_frame_zero_takes_the_first_intervals_rate_for_ifs(monkeypatch):
+    # A23, IFS-like: totals since the start in m, 0.03 by 150 h and 0.09 by 360 h.
+    totals = {(150, (0, 150)): 0.03, (360, (0, 360)): 0.09}
+    frames, report = precip_frames(monkeypatch, config.IFS, IFS_HOURS, ifs_index(), totals)
+    lut = config.IFS.field("precipitation.sfc").lut
+    assert np.array_equal(frames[0][1], frames[1][1])
+    assert np.allclose(lut.decode(frames[0][1]), 0.2, atol=lut.step(0.2) / 2)          # 30 mm over 150 h
+    assert np.allclose(lut.decode(frames[2][1]), 60 / 210, atol=lut.step(60 / 210) / 2)
+    assert [e["interval"] for e in report["intervals"]] == [[0, 150], [150, 360]]
+
+
+def test_a_single_hour_leaves_frame_zero_missing(monkeypatch):
+    # A23: no interval, no rate.
+    from wxpipe.quantize import MISSING
+
+    frames, report = precip_frames(monkeypatch, config.GFS, (6,), index((6,)), {(6, (0, 6)): 12.0})
+    assert len(frames) == 1 and np.all(frames[0][1] == MISSING)
+    assert "intervals" not in report
+
+
 def test_a_failed_move_on_a_rerun_keeps_the_old_release(no_requests, monkeypatch):
     # F5: the old folder is set aside, and put back when the move of the new one fails.
     tmp = no_requests
