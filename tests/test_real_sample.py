@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from wxpipe import config, gfs, tiles, wxt
+from wxpipe import config, ecmwf, gfs, tiles, wxt
 from wxpipe.run import Fetcher, build_instant, parse_cycle, write_field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,7 @@ def no_requests(monkeypatch):
 
     monkeypatch.setattr(gfs, "http_get", refuse)
     monkeypatch.setattr(gfs, "exists", refuse)
+    monkeypatch.setattr(ecmwf, "http_get", refuse)
 
 
 @pytest.mark.parametrize("name", ["temperature.2m", "wind_u.10m", "pressure.msl", "cloud.total"])

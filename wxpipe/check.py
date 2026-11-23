@@ -9,7 +9,10 @@ per source and writes to $GITHUB_OUTPUT, when that variable is set:
     build=<name>:<cycle>,...    the new sources
     all=<name>:<cycle>,...      every source with a complete run, for a site that lost its manifest
 
-An unreadable live manifest counts every source as new.
+A source is new when its newest complete run is later than the live one, so a discovery that falls
+back to an older cycle never replaces a newer release. An unreadable live manifest, a source absent
+from it, or a live release that is not a YYYYMMDDHH string counts the source as new. One source's
+discovery error is printed with its name and counts as no complete run for that source alone.
 """
 
 from __future__ import annotations
@@ -17,11 +20,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 from datetime import datetime, timezone
 
 from . import gfs, source
+
+_RELEASE = re.compile(r"[0-9]{10}")
 
 
 def now() -> datetime:
@@ -34,7 +40,12 @@ def published(name: str, live_manifest: dict | None) -> str | None:
 
 
 def is_new(name: str, release: str, live_manifest: dict | None) -> bool:
-    return published(name, live_manifest) != release
+    """True when [release] is later than the live one, compared as YYYYMMDDHH text, or when there is no
+    readable live release of [name]."""
+    live = published(name, live_manifest)
+    if not isinstance(live, str) or not _RELEASE.fullmatch(live):
+        return True
+    return release > live
 
 
 def outputs(found: dict[str, str | None], live_manifest: dict | None) -> dict[str, str]:
@@ -60,7 +71,12 @@ def main(argv: list[str] | None = None) -> int:
         live = None
     found: dict[str, str | None] = {}
     for info in source.INFOS:
-        cycle = source.latest_complete_cycle(info, now(), gfs.exists)
+        try:
+            cycle = source.latest_complete_cycle(info, now(), gfs.exists)
+        except Exception as e:   # one source's discovery error stays its own
+            print(f"::warning::{info.name}: discovery failed, no complete run counted: {type(e).__name__}: {e}")
+            found[info.name] = None
+            continue
         release = None if cycle is None else f"{cycle:%Y%m%d%H}"
         found[info.name] = release
         if release is None:

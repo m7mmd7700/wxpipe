@@ -29,9 +29,16 @@ def check_grid(source: config.Source, ni: int, nj: int, lat0: float, lon0: float
         raise ValueError(f"unexpected {source.info.name} grid: " + ", ".join(wrong))
 
 
+def roll_to_shared(values: np.ndarray, lon0: float, deg: float = config.DEG) -> np.ndarray:
+    """[values] with their columns rolled so that column 0 lies at the shared grid's LON0, for a
+    delivered grid whose first column lies at [lon0] in steps of [deg]: 720 columns for a 0.25 degree
+    grid that starts at 180E, none for one that starts at 0E."""
+    shift = round((lon0 - config.LON0) / deg) % values.shape[1]
+    return np.roll(values, shift, axis=1)
+
+
 def on_shared_grid(values: np.ndarray) -> np.ndarray:
-    """[values] if they are on the shared (NY, NX) grid; ValueError otherwise, as for a source whose
-    delivered grid matches its description but is not yet put on the shared one."""
+    """[values] if they are on the shared (NY, NX) grid; ValueError otherwise."""
     if values.shape != (config.NY, config.NX):
         raise ValueError(f"grid of shape {values.shape} is not the shared {(config.NY, config.NX)}")
     return values
@@ -40,8 +47,8 @@ def on_shared_grid(values: np.ndarray) -> np.ndarray:
 def decode(message: bytes, source: config.Source) -> np.ndarray:
     """The message's values on the shared grid. A delivered grid other than the source's is refused.
 
-    Every source of S13 delivers the shared grid itself; a grid that starts at 180E is rolled here
-    when such a source comes (S14).
+    The delivered grid is checked against the source's description, then its columns are rolled onto
+    the shared grid by where its first column lies (IFS's starts at 180E), then its shape is checked.
     """
     handle = eccodes.codes_new_from_message(message)
     try:
@@ -54,7 +61,8 @@ def decode(message: bytes, source: config.Source) -> np.ndarray:
                    eccodes.codes_get(handle, "jDirectionIncrementInDegrees"),
                    eccodes.codes_get(handle, "jScansPositively"),
                    eccodes.codes_get(handle, "iScansNegatively"))
-        values = on_shared_grid(np.asarray(eccodes.codes_get_values(handle), dtype=np.float64).reshape(nj, ni))
+        values = np.asarray(eccodes.codes_get_values(handle), dtype=np.float64).reshape(nj, ni)
+        values = on_shared_grid(roll_to_shared(values, source.grid.lon0))
         if eccodes.codes_get(handle, "bitmapPresent"):
             values[values == eccodes.codes_get(handle, "missingValue")] = np.nan
         return values

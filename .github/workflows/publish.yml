@@ -19,8 +19,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # A normal run takes 2 to 4 minutes; 180 leaves room for a run that builds every source after a
-    # lost cache. A job's timeout cannot read a step's output, so it is 180 in every run.
+    # A GFS run takes 2 to 4 minutes; a run that builds GFS defers ECMWF to the next run. An ECMWF run
+    # is longer: its probe, index reads and message reads share one 45-minute limit, each read checked
+    # before it starts, so a read in progress can overrun it by its own retries, up to about 16 minutes.
+    # 180 leaves room for a run that builds every source after a lost cache. A job's timeout cannot
+    # read a step's output, so it is 180 in every run.
     timeout-minutes: 180
     outputs:
       published: ${{ steps.run.outputs.published }}
@@ -60,12 +63,32 @@ jobs:
           key: site-${{ github.run_id }}
           restore-keys: site-
 
+      # ECMWF's downloads of an earlier try, so a job dropped on a stuck file reads only what is missing.
+      # Only when ECMWF is built: a run that also builds GFS defers it.
+      - name: Restore ECMWF's downloads
+        if: steps.check.outputs.new == 'true' && contains(steps.check.outputs.build, 'ifs:') && !contains(steps.check.outputs.build, 'gfs:')
+        uses: actions/cache/restore@v6
+        with:
+          path: work/ifs
+          key: ifs-work-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ifs-work-
+
       # The new sources, or every source with a complete run when the restored site has no readable
       # manifest; wxpipe.run then says so in the run's summary.
       - name: Build the new runs
         id: run
         if: steps.check.outputs.new == 'true'
         run: python -m wxpipe.run --out site --work work --cycles "${{ steps.check.outputs.build }}" --all-cycles "${{ steps.check.outputs.all }}"
+
+      # Also after a failed build, whenever work/ifs holds a file; wxpipe.run keeps one cycle there. A
+      # cache problem never stops the gate or the upload.
+      - name: Keep ECMWF's downloads for the next try
+        if: ${{ !cancelled() && hashFiles('work/ifs/**') != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: work/ifs
+          key: ifs-work-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Above the limit it drops what its order allows; if that is not enough it fails, and nothing is uploaded.
       - name: Size gate

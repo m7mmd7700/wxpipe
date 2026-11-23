@@ -4,18 +4,24 @@ The workflow's form builds the sources that `wxpipe.check` found, every forecast
 
     python -m wxpipe.run --out site --work work --cycles gfs:2026110712 --all-cycles gfs:2026110712
 
-When the site has no readable manifest, a lost cache, it builds every source of --all-cycles instead.
+When the site has no readable manifest, a lost cache, it builds every source of --all-cycles instead,
+and refuses the run when GFS is not among the sources built.
 
 The local form builds one source:
 
-    python -m wxpipe.run --out site [--source gfs] [--cycle 2026110712] [--hours 0,1,6] [--fields temperature.2m]
+    python -m wxpipe.run --out site [--source gfs|ifs] [--cycle 2026110712] [--hours 0,1,6] [--fields temperature.2m]
 
 Without --cycle it takes the newest run whose last forecast hour is published. With
 --published-manifest it stops early when that run is already on the site.
 
-Every source's index files are read and checked before anything is written: a run with a missing
-record that a frame needs is refused, and the site stays as it was. It writes `published=true|false`
-to $GITHUB_OUTPUT and each built source's lines to $GITHUB_STEP_SUMMARY when those variables are set.
+Each source is a job of its own, built in the order of `config.SOURCES`: its probe, its index reads,
+its gaps, then its release, built under <work>/stage/ and moved into the site once whole. A job that
+fails at any step, a record missing that a frame needs among them, is skipped with an `::error::` line
+and a `**Skipped:**` summary line, and leaves the site as it was; the other jobs go on. In the
+workflow's form, a run that builds GFS defers every other source to the next run, with a `::notice::`
+and a `**Deferred:**` line, and a job whose release is earlier than the restored site's is skipped. A
+run fails only when no job was built. It writes `published=true|false` to $GITHUB_OUTPUT and each built
+source's lines to $GITHUB_STEP_SUMMARY when those variables are set.
 """
 
 from __future__ import annotations
@@ -23,7 +29,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -34,14 +42,26 @@ from pathlib import Path
 
 import numpy as np
 
-from . import config, gfs, grib, precip, site, source, summary, tiles, wxt
+from . import check, config, gfs, grib, precip, site, source, summary, tiles, wxt
 
 
 class RunRefused(ValueError):
-    """A run whose index files lack a record that a frame needs."""
+    """A run in which every source was skipped, or a lost cache's run without GFS: nothing is published."""
+
+
+class JobDropped(Exception):
+    """A source's job dropped for a reason the pipeline states itself: its gaps, its probe or its read
+    time limit."""
 
 
 LOST_MANIFEST = "The site has no readable manifest.json: every source is built in this run."
+ROOT = Path(__file__).resolve().parents[1]
+PROBE_TIMEOUT = 300
+
+
+def clock() -> float:
+    """Seconds, for each job's time and its read time limit; tests replace it."""
+    return time.time()
 
 
 def parse_cycle(text: str) -> datetime:
@@ -52,9 +72,21 @@ def valid_time(cycle: datetime, fhour: int) -> int:
     return int((cycle + timedelta(hours=fhour)).timestamp())
 
 
+def write_atomically(path: Path, data: bytes) -> None:
+    """Writes [path] through `<name>.part` in the same folder, so a killed run never leaves a short file
+    under the final name."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".part")
+    part.write_bytes(data)
+    os.replace(part, path)
+
+
 class Fetcher:
     """Byte-range reads of one source's run with a cache under work/, so reruns and tests read local files:
-    <work>/<source>/<cycle>/f<FFF>.idx for an index, <work>/<source>/<cycle>/f<FFF>/<record>.grib2 for a message."""
+    <work>/<source>/<cycle>/f<FFF>.idx for an index, <work>/<source>/<cycle>/f<FFF>/<record>.grib2 for a message.
+
+    Every file is written atomically. A cached message is reused only when its size is its record's
+    length, when that is known; a cached index that does not parse is read again once."""
 
     def __init__(self, src: config.Source, cycle: datetime, work: Path, workers: int = 8):
         self.source = src
@@ -62,6 +94,7 @@ class Fetcher:
         self.root = work / src.info.name / f"{cycle:%Y%m%d%H}"
         self.workers = workers
         self.downloaded = 0
+        self.deadline: float | None = None   # by clock(); a read started after it drops the job
 
     def idx_path(self, fhour: int) -> Path:
         return self.root / f"f{fhour:03d}.idx"
@@ -69,23 +102,38 @@ class Fetcher:
     def message_path(self, fhour: int, number: int) -> Path:
         return self.root / f"f{fhour:03d}" / f"{number}.grib2"
 
+    def check_deadline(self) -> None:
+        if self.deadline is not None and clock() > self.deadline:
+            raise JobDropped(f"read time limit of {self.source.read_limit_seconds / 60:.0f} min passed; "
+                             "the files read so far are kept")
+
+    def _read_idx(self, fhour: int, path: Path) -> None:
+        data = self.source.read(source.idx_url(self.source.info, self.cycle, fhour))
+        self.downloaded += len(data)
+        write_atomically(path, data)
+
     def idx(self, fhour: int) -> list:
+        self.check_deadline()
         path = self.idx_path(fhour)
         if not path.exists():
-            data = self.source.read(source.idx_url(self.source.info, self.cycle, fhour))
-            self.downloaded += len(data)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-        return self.source.parse_idx(path.read_text(encoding="utf-8"))
+            self._read_idx(fhour, path)
+            return self.source.parse_idx(path.read_text(encoding="utf-8"))
+        try:
+            return self.source.parse_idx(path.read_text(encoding="utf-8"))
+        except ValueError:   # a cached index that does not parse is read once more
+            path.unlink()
+            self._read_idx(fhour, path)
+            return self.source.parse_idx(path.read_text(encoding="utf-8"))
 
     def _message(self, fhour: int, record) -> bytes:
+        self.check_deadline()
         path = self.message_path(fhour, record.number)
         if path.exists():
-            return path.read_bytes()
+            if record.end is None or path.stat().st_size == record.end - record.offset + 1:
+                return path.read_bytes()
         data = self.source.read(source.file_url(self.source.info, self.cycle, fhour), (record.offset, record.end))
         self.downloaded += len(data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        write_atomically(path, data)
         return data
 
     def messages(self, items: list[tuple[int, object]]) -> dict[tuple[int, int], bytes]:
@@ -181,9 +229,10 @@ def write_field(release_dir: Path, src: config.Source, field: config.Field, rele
 
 
 def release_entry(src: config.Source, cycle: datetime, hours, fields) -> dict:
-    """A source's entry in the manifest, in the key order the app and the site have always had."""
+    """A source's entry in the manifest, in the key order the app and the site have always had; a source
+    with the licence's elements adds them as `attribution_parts` right after `attribution`."""
     release = f"{cycle:%Y%m%d%H}"
-    return {
+    entry = {
         "release": release,
         "run_time": int(cycle.timestamp()),
         "path": f"{src.info.name}/{release}",
@@ -191,8 +240,12 @@ def release_entry(src: config.Source, cycle: datetime, hours, fields) -> dict:
         "levels": [{"size": lv.size, "region_only": lv.region_only} for lv in config.LEVELS],
         "region": config.REGION,
         "fields": {f.name: {"units": f.units, "values": f.lut.header()} for f in fields},
-        "attribution": src.attribution,
+        "attribution": src.attribution_for(cycle.year),
     }
+    parts = src.attribution_parts_for(cycle.year)
+    if parts is not None:
+        entry["attribution_parts"] = parts
+    return entry
 
 
 def read_manifest(location: str | None) -> dict | None:
@@ -237,10 +290,46 @@ class Job:
     fetcher: Fetcher | None = None
     idx: dict | None = None
     report: dict | None = None
+    started: float | None = None   # by clock(), at its probe or its index reads
 
     @property
     def release(self) -> str:
         return f"{self.cycle:%Y%m%d%H}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.source.info.name} {self.release}"
+
+
+def probe(src: config.Source) -> None:
+    """Runs `python -m wxpipe.probe <name>` in a child process, so that an ecCodes crash ends the child
+    only. A non-zero exit, a crash or a timeout raises JobDropped with the child's text."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), env.get("PYTHONPATH", "")) if p)
+    name = src.info.name
+    try:
+        done = subprocess.run([sys.executable, "-m", "wxpipe.probe", name], cwd=ROOT, env=env,
+                              capture_output=True, text=True, timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise JobDropped(f"probe of {name} timed out after {PROBE_TIMEOUT} s") from None
+    if done.returncode != 0:
+        text = " ".join(((done.stderr or "") + " " + (done.stdout or "")).split())
+        raise JobDropped(f"probe of {name} failed, exit {done.returncode}: {text or 'no output'}")
+
+
+def clear_other_cycles(src: config.Source, work: Path, cycle: datetime) -> list[str]:
+    """Deletes every cycle folder under <work>/<name>/ but [cycle]'s, so the kept cache holds one run.
+    Only folders named as a cycle, YYYYMMDDHH, are touched. Returns the deleted names."""
+    root = work / src.info.name
+    if not root.is_dir():
+        return []
+    keep = f"{cycle:%Y%m%d%H}"
+    deleted = []
+    for folder in sorted(root.iterdir()):
+        if folder.is_dir() and re.fullmatch(r"[0-9]{10}", folder.name) and folder.name != keep:
+            shutil.rmtree(folder)
+            deleted.append(folder.name)
+    return deleted
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -282,7 +371,8 @@ def main(argv: list[str] | None = None) -> int:
             chosen = site.to_build(site.parse_cycles(args.cycles), site.parse_cycles(args.all_cycles), has_manifest)
         except ValueError as e:
             p.error(str(e))
-        if not has_manifest:
+        lost = not has_manifest
+        if lost:
             print(LOST_MANIFEST)
             summary.append([LOST_MANIFEST])
         jobs = []
@@ -314,79 +404,158 @@ def main(argv: list[str] | None = None) -> int:
             set_output(published=published([]), release=job.release)
             return 0
         jobs = [job]
+        lost = False   # a local build into a new folder is not a lost cache
 
-    # Every source's index files are read first, then every source's gaps are checked, all before any
-    # release folder is touched; one error names every source and release with its gaps.
-    started = time.time()
+    workflow = args.cycles is not None
+    on_site = site.read_manifest(out / "manifest.json") if workflow else None
+    # Each job on its own, in the order of config.SOURCES: one source's failure skips that source only.
+    order = {s.info.name: k for k, s in enumerate(config.SOURCES)}
+    jobs.sort(key=lambda job: order.get(job.source.info.name, len(order)))
+    built: dict = {}
+    done: list[Job] = []
+    lines: list[str] = []
+    skipped: list[str] = []
     for job in jobs:
-        job.fetcher = Fetcher(job.source, job.cycle, args.work, args.workers)
-        with ThreadPoolExecutor(args.workers) as pool:
-            job.idx = dict(zip(job.hours, pool.map(job.fetcher.idx, job.hours)))
-    refused = []
-    for job in jobs:
-        missing = gaps(job.source, job.idx, job.hours, args.precip_method, job.fields)
-        if missing:
-            refused.append(f"{job.source.info.name} {job.release}: " + ", ".join(f"{name} at hour {h}" for name, h in missing))
-    if refused:
-        _fail(RunRefused("run refused, records missing: " + "; ".join(refused)))
+        name = job.source.info.name
+        if workflow and "gfs" in built:
+            # GFS never waits on another source's reads: the next hourly run, in which GFS is not new,
+            # builds the others alone.
+            print(f"::notice::Deferred {job.label}: GFS is built in this run; tried in the next run")
+            summary.append([f"**Deferred:** {job.label}: GFS is built in this run"])
+            continue
+        try:
+            if workflow:
+                _refuse_an_earlier_release(job, on_site)
+            _prepare(job, args)
+            built[name] = _build(job, out, args)
+        except Exception as e:   # anything, a programming error included, so GFS still publishes
+            skipped.append(_skip(job, e, args))
+            continue
+        done.append(job)
+        lines += summary_lines(name, job.release, len(job.hours), len(job.fields),
+                               job.report["seconds"], job.fetcher.downloaded)
 
-    # A delivered grid that differs stops the build here, before the manifest is written or anything pruned.
-    try:
-        built, lines = _build(jobs, out, args, started)
-    except RunRefused:
-        raise
-    except ValueError as e:
-        _fail(e)
-    _finish(jobs, out, args, built, lines)
+    if not built:
+        _fail(RunRefused("run refused, every source skipped: " + "; ".join(skipped)))
+    if lost and "gfs" not in built:
+        _fail(RunRefused("run refused: the site has no readable manifest.json and GFS was not built, so "
+                         "no manifest is written and nothing is published; the live site stays as it was"))
+    _finish(done, out, args, built, lines)
     return 0
 
 
+def _refuse_an_earlier_release(job: Job, on_site: dict | None) -> None:
+    """Drops a job whose release is earlier than the one the restored site already holds, by
+    `check.is_new`'s rule; the same release is built again, as a rerun after a failed deploy."""
+    name = job.source.info.name
+    current = check.published(name, on_site)
+    if current != job.release and not check.is_new(name, job.release, on_site):
+        raise JobDropped(f"the site already holds the later release {current}")
+
+
+def _prepare(job: Job, args) -> None:
+    """A job's steps before its build: the cache's other cycles cleared, the probe, the index reads under
+    the source's time limit, which then runs on through the build's message reads, and the gaps. Any
+    failure raises."""
+    src = job.source
+    if src.cache_one_cycle:
+        clear_other_cycles(src, args.work, job.cycle)
+    job.started = clock()
+    if src.probes:
+        probe(src)
+    job.fetcher = Fetcher(src, job.cycle, args.work, src.workers or args.workers)
+    if src.read_limit_seconds is not None:
+        job.fetcher.deadline = job.started + src.read_limit_seconds
+    with ThreadPoolExecutor(job.fetcher.workers) as pool:
+        job.idx = dict(zip(job.hours, pool.map(job.fetcher.idx, job.hours)))
+    missing = gaps(src, job.idx, job.hours, args.precip_method, job.fields)
+    if missing:
+        raise JobDropped("records missing: " + ", ".join(f"{name} at hour {h}" for name, h in missing))
+    job.fetcher.check_deadline()
+
+
+def _skip(job: Job, error: Exception, args) -> str:
+    """Deletes a dropped job's stage folder and names it on the run's page and in its summary."""
+    shutil.rmtree(_stage(job, args), ignore_errors=True)
+    reason = str(error) if isinstance(error, JobDropped) else f"{type(error).__name__}: {error}"
+    text = f"{job.label}: {reason}"
+    print(f"::error::Skipped {text}")
+    summary.append([f"**Skipped:** {text}"])
+    return text
+
+
 def _fail(error: Exception) -> None:
-    """Names a refused run or a refused grid on the run's page and in its summary, then raises it again."""
+    """Names a refused run on the run's page and in its summary, then raises it again."""
     message = str(error)
     print(f"::error::{message}")
     summary.append([f"**Refused:** {message}"])
     raise error
 
 
-def _build(jobs: list, out: Path, args, started: float) -> tuple[dict, list[str]]:
-    """Builds every job's release folder; returns each source's manifest entry and its summary lines."""
-    built = {}
-    lines = []
-    for k, job in enumerate(jobs):
-        t_source = started if k == 0 else time.time()   # the first source's time includes the index reads
-        name, release = job.source.info.name, job.release
-        release_dir = out / name / release
+def _stage(job: Job, args) -> Path:
+    return args.work / "stage" / job.source.info.name / job.release
+
+
+def _build(job: Job, out: Path, args) -> dict:
+    """Builds a job's release under <work>/stage/<name>/<release>/, then moves it whole into the site,
+    replacing a folder of the same release. Returns the source's manifest entry."""
+    name, release = job.source.info.name, job.release
+    stage = _stage(job, args)
+    if stage.exists():   # left by a killed run
+        shutil.rmtree(stage)
+    report = {"release": release, "hours": list(job.hours), "precip_method": args.precip_method, "fields": {}}
+    for field in job.fields:
+        t0 = time.time()
+        if field.kind == "precip_rate":
+            precip_report: dict = {}
+            frames = build_precip(job.source, field, job.cycle, job.hours, job.idx, job.fetcher,
+                                  args.precip_method, precip_report)
+            report["precipitation"] = precip_report
+        else:
+            frames = build_instant(job.source, field, job.cycle, job.hours, job.idx, job.fetcher)
+        sizes = write_field(stage, job.source, field, release, frames)
+        report["fields"][field.name] = {"seconds": round(time.time() - t0, 1), "levels": sizes}
+        print(f"{field.name}: {sum(s['bytes'] for s in sizes.values()) / 1e6:.1f} MB in {time.time() - t0:.0f} s")
+    entry = release_entry(job.source, job.cycle, job.hours, job.fields)
+    # The job's time runs from its probe or index reads to its move; the move is the last step that can
+    # fail, so a skipped job never leaves its release in the site.
+    report["downloaded_bytes"] = job.fetcher.downloaded
+    report["seconds"] = round(clock() - job.started, 1)
+    args.work.mkdir(parents=True, exist_ok=True)
+    (args.work / f"report-{name}-{release}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+    _move_in(stage, out / name / release, args.work / "stage" / name / f"{release}.old")
+    job.report = report
+    return entry
+
+
+def _move_in(stage: Path, release_dir: Path, old: Path) -> None:
+    """Moves a built release into the site. A folder of the same release is set aside at [old] first and
+    deleted only once the new one is in place; if the move fails, any partial folder is removed and the
+    old one put back."""
+    release_dir.parent.mkdir(parents=True, exist_ok=True)
+    if old.exists():
+        shutil.rmtree(old)
+    if release_dir.exists():
+        old.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(release_dir), str(old))
+    try:
+        shutil.move(str(stage), str(release_dir))
+    except BaseException:
         if release_dir.exists():
-            shutil.rmtree(release_dir)
-        report = {"release": release, "hours": list(job.hours), "precip_method": args.precip_method, "fields": {}}
-        for field in job.fields:
-            t0 = time.time()
-            if field.kind == "precip_rate":
-                precip_report: dict = {}
-                frames = build_precip(job.source, field, job.cycle, job.hours, job.idx, job.fetcher,
-                                      args.precip_method, precip_report)
-                report["precipitation"] = precip_report
-            else:
-                frames = build_instant(job.source, field, job.cycle, job.hours, job.idx, job.fetcher)
-            sizes = write_field(release_dir, job.source, field, release, frames)
-            report["fields"][field.name] = {"seconds": round(time.time() - t0, 1), "levels": sizes}
-            print(f"{field.name}: {sum(s['bytes'] for s in sizes.values()) / 1e6:.1f} MB in {time.time() - t0:.0f} s")
-        built[name] = release_entry(job.source, job.cycle, job.hours, job.fields)
-        report["downloaded_bytes"] = job.fetcher.downloaded
-        report["seconds"] = round(time.time() - t_source, 1)
-        args.work.mkdir(parents=True, exist_ok=True)
-        (args.work / f"report-{name}-{release}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
-        lines += summary_lines(name, release, len(job.hours), len(job.fields), report["seconds"], job.fetcher.downloaded)
-        job.report = report
-    return built, lines
+            shutil.rmtree(release_dir, ignore_errors=True)
+        if old.exists():
+            shutil.move(str(old), str(release_dir))
+        raise
+    if old.exists():
+        shutil.rmtree(old)
 
 
 def _finish(jobs: list, out: Path, args, built: dict, lines: list[str]) -> None:
-    """Writes the manifest once, prunes, and reports."""
+    """Writes the manifest once, prunes, and reports the built jobs."""
     # The manifest is written once for every source. A source's release already on the site becomes its
     # "previous", so a phone holding the old manifest can still read its tiles while the new one
-    # propagates; a rerun of the same release keeps the previous one. Older releases are deleted.
+    # propagates; a rerun of the same release keeps the previous one. Older releases are deleted. A
+    # skipped source keeps its entries and its folders.
     manifest = site.merge(site.read_manifest(out / "manifest.json"), built, args.keep, datetime.now(timezone.utc))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     site.prune(out, manifest, built)

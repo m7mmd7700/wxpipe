@@ -11,10 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from wxpipe import check, gfs, source
+from wxpipe import check, ecmwf, gfs, source
 
 ROOT = Path(__file__).resolve().parents[1]
-STDLIB_MODULES = ["check", "source", "gfs", "site", "gate", "summary"]
+STDLIB_MODULES = ["check", "source", "gfs", "ecmwf", "site", "gate", "summary"]
+REAL_EXISTS = gfs.exists   # for the test of its answers, with an injected opener
 
 BLOCKER = """
 import sys
@@ -38,6 +39,7 @@ def no_requests(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gfs, "http_get", refuse)
     monkeypatch.setattr(gfs, "exists", refuse)
+    monkeypatch.setattr(ecmwf, "http_get", refuse)
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output.txt"))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
 
@@ -146,3 +148,113 @@ def test_outputs_with_two_sources():
     live = {"sources": {"gfs": {"release": "2026110800"}, "ifs": {"release": "2026110712"}}}
     got = check.outputs({"gfs": "2026110800", "ifs": "2026110800", "gfswave": None}, live)
     assert got == {"new": "true", "build": "ifs:2026110800", "all": "gfs:2026110800,ifs:2026110800"}
+
+
+# ---- D5: only a newer release is new ------------------------------------------------------------
+
+def test_only_a_newer_release_is_new():
+    # A12.
+    def live(release):
+        return {"sources": {"ifs": {"release": release}}}
+
+    assert check.is_new("ifs", "2026112312", live("2026112300"))
+    assert not check.is_new("ifs", "2026112312", live("2026112312"))
+    assert not check.is_new("ifs", "2026112300", live("2026112312"))   # discovery fell back to an older run
+    assert check.is_new("ifs", "2026112312", None)                     # unreadable manifest
+    assert check.is_new("ifs", "2026112312", {"sources": {"gfs": {"release": "2026112312"}}})
+    other_digits = "".join(chr(0x0660 + int(d)) for d in "2026112400")   # digits that are not 0-9
+    for bad in (2026112400, "20261124", "2026112400x", None, ["2026112400"], other_digits):
+        assert check.is_new("ifs", "2026112312", live(bad)), bad
+    assert check.outputs({"gfs": "2026110718", "ifs": "2026112300"},
+                         {"sources": {"gfs": {"release": "2026110800"}, "ifs": {"release": "2026112300"}}}) == {
+        "new": "false", "build": "", "all": "gfs:2026110718,ifs:2026112300"}
+
+
+# ---- D6: discovery's errors stay in their source ---------------------------------------------------
+
+def test_one_sources_discovery_error_leaves_the_other(offline, monkeypatch, capsys):
+    # A13.
+    live, output = offline
+    live["body"] = json.dumps({"sources": {"gfs": {"release": "2026110718"}}}).encode()
+    complete = source.idx_url(source.GFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), source.GFS.last_hour)
+
+    def exists(url):
+        if url.startswith(source.IFS.base_url):
+            raise ConnectionError("connection reset")
+        return url == complete
+
+    monkeypatch.setattr(gfs, "exists", exists)
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output) == {"new": "true", "build": f"gfs:{NEWEST}", "all": f"gfs:{NEWEST}"}
+    assert ("::warning::ifs: discovery failed, no complete run counted: ConnectionError: connection reset"
+            in capsys.readouterr().out)
+
+    # And the other way round: GFS's error leaves IFS's run as it would be.
+    ifs_complete = source.idx_url(source.IFS, datetime(2026, 11, 7, 12, tzinfo=timezone.utc), 360)
+
+    def exists2(url):
+        if url.startswith(source.GFS.base_url):
+            raise TimeoutError("timed out")
+        return url == ifs_complete
+
+    monkeypatch.setattr(gfs, "exists", exists2)
+    output.unlink()
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output) == {"new": "true", "build": "ifs:2026110712", "all": "ifs:2026110712"}
+
+
+class Answer:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError("https://example.invalid/x", code, "answer", None, None)
+
+
+def opener_of(*answers):
+    """A urlopen that gives [answers] in turn: a status, or an exception to raise."""
+    asked = []
+
+    def opener(request, timeout=None):
+        asked.append(request.get_method())
+        answer = answers[len(asked) - 1]
+        if isinstance(answer, BaseException):
+            raise answer
+        return Answer(answer)
+
+    opener.asked = asked
+    return opener
+
+
+def test_exists_answers_and_retries(monkeypatch):
+    # A13: the real gfs.exists, taken before the autouse fixture replaced it, with an injected opener
+    # and waits; no opener here reaches the network, and a sleep fails the test.
+    import time
+
+    def no_sleep(seconds):
+        raise AssertionError("slept")
+
+    monkeypatch.setattr(time, "sleep", no_sleep)
+    exists = REAL_EXISTS
+    waits = []
+    assert exists("https://example.invalid/x", opener=opener_of(200), wait=waits.append) is True
+    assert exists("https://example.invalid/x", opener=opener_of(http_error(404)), wait=waits.append) is False
+    assert exists("https://example.invalid/x", opener=opener_of(http_error(403)), wait=waits.append) is False
+    assert waits == []
+    opener = opener_of(http_error(503), 200)
+    assert exists("https://example.invalid/x", opener=opener, wait=waits.append) is True
+    assert waits == [1] and opener.asked == ["HEAD", "HEAD"]
+    waits.clear()
+    opener = opener_of(http_error(429), TimeoutError("t"), ConnectionError("c"), http_error(503))
+    with pytest.raises(Exception) as e:
+        exists("https://example.invalid/x", opener=opener, wait=waits.append)
+    assert getattr(e.value, "code", None) == 503
+    assert waits == list(gfs.EXISTS_WAITS) == [1, 2, 4] and len(opener.asked) == 4

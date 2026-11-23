@@ -19,8 +19,9 @@ class SourceInfo:
     cycle_hours: int      # hours between two runs
     base_url: str         # the bucket
     file_pattern: str     # str.format pattern of a file's URL, with {base}, {cycle} (a datetime) and {hour}
-    idx_suffix: str       # appended to a file's URL for its index
+    idx_suffix: str       # appended to the pattern for a file's index
     lookback_cycles: int  # how many cycles back the discovery looks for a complete run
+    file_suffix: str = ""  # appended to the pattern for the file itself
 
 
 GFS = SourceInfo(
@@ -33,8 +34,21 @@ GFS = SourceInfo(
     lookback_cycles=6,
 )
 
+# ECMWF IFS 0.25 degree on ECMWF's open-data mirror on AWS: the 00 and 12 runs to 360 h. A run is
+# complete once step 360's index is there; four cycles back is two days.
+IFS = SourceInfo(
+    name="ifs",
+    last_hour=360,
+    cycle_hours=12,
+    base_url="https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com",
+    file_pattern="{base}/{cycle:%Y%m%d}/{cycle:%H}z/ifs/0p25/oper/{cycle:%Y%m%d%H}0000-{hour}h-oper-fc",
+    idx_suffix=".index",
+    lookback_cycles=4,
+    file_suffix=".grib2",
+)
+
 # The standard-library parts of every source, in the order of wxpipe.config.SOURCES (checked by a test).
-INFOS: tuple[SourceInfo, ...] = (GFS,)
+INFOS: tuple[SourceInfo, ...] = (GFS, IFS)
 
 
 def info(name: str) -> SourceInfo:
@@ -44,12 +58,16 @@ def info(name: str) -> SourceInfo:
     raise KeyError(name)
 
 
-def file_url(source: SourceInfo, cycle: datetime, hour: int) -> str:
+def _stem(source: SourceInfo, cycle: datetime, hour: int) -> str:
     return source.file_pattern.format(base=source.base_url, cycle=cycle, hour=hour)
 
 
+def file_url(source: SourceInfo, cycle: datetime, hour: int) -> str:
+    return _stem(source, cycle, hour) + source.file_suffix
+
+
 def idx_url(source: SourceInfo, cycle: datetime, hour: int) -> str:
-    return file_url(source, cycle, hour) + source.idx_suffix
+    return _stem(source, cycle, hour) + source.idx_suffix
 
 
 def latest_complete_cycle(source: SourceInfo, now: datetime, exists: Callable[[str], bool],

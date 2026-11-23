@@ -1,7 +1,8 @@
-"""Hourly precipitation rate from GFS accumulations.
+"""Hourly precipitation rate from a source's accumulations.
 
 GFS stores APCP two ways in each file after hour 6: the total since the run started (`0-7 hour acc`,
 `0-5 day acc`, ...) and a bucket that restarts every 6 hours (`6-7 hour acc`, `120-126 hour acc`).
+ECMWF IFS stores `tp` only as the total since the run started, its window (0, now) under either method.
 The rate over the frame interval (prev, now] is
 
     (A(a, now) - A(a, prev)) / (now - prev),   with A(a, prev) = 0 when a == prev,

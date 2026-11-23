@@ -211,6 +211,77 @@ def test_the_cheap_check_agrees_with_the_config(monkeypatch):
 # test in tests/test_check.py, which blocks numpy and eccodes and imports every standard-library module.
 
 
+# ---- the roll onto the shared grid (D9) ------------------------------------------------------
+
+def test_roll_to_shared_on_a_small_grid():
+    # A7: 8 columns of 45 degrees.
+    from wxpipe import grib
+
+    values = np.arange(16).reshape(2, 8)
+    assert grib.roll_to_shared(values, 180.0, deg=45.0).tolist() == np.roll(values, 4, axis=1).tolist()
+    ninety = grib.roll_to_shared(values, 90.0, deg=45.0)
+    assert ninety[:, 0].tolist() == values[:, 6].tolist()          # the delivered column 6 lies at 0E
+    assert ninety[:, 2].tolist() == values[:, 0].tolist()          # the delivered column 0 lies at 90E
+    assert grib.roll_to_shared(values, 0.0, deg=45.0).tolist() == values.tolist()
+
+
+def test_roll_to_shared_on_the_ifs_width():
+    from wxpipe import grib
+
+    row = np.arange(config.NX, dtype=np.float64).reshape(1, config.NX)
+    rolled = grib.roll_to_shared(row, 180.0)
+    assert rolled.tolist() == np.roll(row, 720, axis=1).tolist()
+    assert rolled[0, 0] == 720.0          # the delivered column 720 lies at 0E
+    assert rolled[0, 720] == 0.0          # the delivered first column lies at 180E
+    assert grib.roll_to_shared(row, 0.0).tolist() == row.tolist()
+
+
+class FakeCodes:
+    """Stands in for eccodes in grib.decode: IFS's delivered grid, values 0, 1, 2, ... and no bitmap."""
+
+    def __init__(self, src):
+        g = src.grid
+        self.keys = {"Ni": g.ni, "Nj": g.nj, "latitudeOfFirstGridPointInDegrees": g.lat0,
+                     "longitudeOfFirstGridPointInDegrees": g.lon0, "iDirectionIncrementInDegrees": g.di,
+                     "jDirectionIncrementInDegrees": g.dj, "jScansPositively": g.j_scans_positively,
+                     "iScansNegatively": g.i_scans_negatively, "bitmapPresent": 0}
+        self.released = []
+
+    def codes_new_from_message(self, message):
+        return "handle"
+
+    def codes_get(self, handle, key):
+        return self.keys[key]
+
+    def codes_get_values(self, handle):
+        return np.arange(self.keys["Ni"] * self.keys["Nj"], dtype=np.float64)
+
+    def codes_release(self, handle):
+        self.released.append(handle)
+
+
+def test_decode_checks_rolls_then_checks_the_shape(monkeypatch):
+    # A7: the order by a spy, with no real IFS decode (R9).
+    from wxpipe import grib
+
+    calls = []
+    fake = FakeCodes(config.IFS)
+    monkeypatch.setattr(grib, "eccodes", fake)
+    for name in ("check_grid", "roll_to_shared", "on_shared_grid"):
+        real = getattr(grib, name)
+        monkeypatch.setattr(grib, name, lambda *a, _real=real, _name=name, **k: (calls.append(_name), _real(*a, **k))[1])
+    values = grib.decode(b"message", config.IFS)
+    assert calls == ["check_grid", "roll_to_shared", "on_shared_grid"]
+    assert fake.released == ["handle"]
+    delivered = np.arange(config.NX * config.NY, dtype=np.float64).reshape(config.NY, config.NX)
+    assert values.shape == (config.NY, config.NX)
+    assert np.array_equal(values, np.roll(delivered, 720, axis=1))
+    assert values[0, 0] == 720.0
+    # GFS's delivered grid is the shared one: no roll.
+    monkeypatch.setattr(grib, "eccodes", FakeCodes(config.GFS))
+    assert np.array_equal(grib.decode(b"message", config.GFS), delivered)
+
+
 # ---- precipitation --------------------------------------------------------------------------
 
 def grid(value):

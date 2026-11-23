@@ -6,6 +6,7 @@ since `check.py` imports this module before any install.
 
 from __future__ import annotations
 
+import http.client
 import re
 import time
 import urllib.error
@@ -115,10 +116,33 @@ def read(url: str, byte_range: tuple[int, int | None] | None = None) -> bytes:
     return http_get(url, byte_range)
 
 
-def exists(url: str) -> bool:
+# The waits between the four attempts of `exists`, in seconds: shorter than ECMWF's reads, since GFS's
+# bucket has not been seen to throttle.
+EXISTS_WAITS: tuple[int, ...] = (1, 2, 4)
+
+
+def exists(url: str, opener=None, wait=None) -> bool:
+    """Whether [url] answers, by a HEAD request; the run discovery of every source uses it.
+
+    A 404 or any other 4xx answer but 429 is False. A 429 or 5xx answer, a timeout or a connection
+    error is tried again after EXISTS_WAITS and then raised, so the caller can tell "not there" from
+    "not known". [opener] and [wait] default to urllib's urlopen and time.sleep, and tests inject them.
+    """
+    opener = urllib.request.urlopen if opener is None else opener
+    wait = time.sleep if wait is None else wait
     request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status == 200
-    except urllib.error.HTTPError:
-        return False
+    attempts = len(EXISTS_WAITS) + 1
+    for attempt in range(attempts):
+        try:
+            with opener(request, timeout=30) as response:
+                return response.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and e.code < 500:
+                return False
+            if attempt == attempts - 1:
+                raise
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError):
+            if attempt == attempts - 1:
+                raise
+        wait(EXISTS_WAITS[attempt])
+    raise AssertionError("unreachable")
