@@ -1,4 +1,8 @@
-"""GFS 0.25 degree files on the NOAA Open Data bucket on AWS: run discovery, .idx parsing, byte-range reads."""
+"""GFS 0.25 degree files on the NOAA Open Data bucket on AWS: .idx parsing, record pickers, HTTP reads.
+
+The URLs and the run discovery come from GFS's description in `wxpipe.source`. Standard library only,
+since `check.py` imports this module before any install.
+"""
 
 from __future__ import annotations
 
@@ -7,18 +11,19 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-BASE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+from . import source
+
 USER_AGENT = "wxpipe/0.1 (personal weather app pipeline)"
 
 
 def file_url(cycle: datetime, fhour: int) -> str:
-    return f"{BASE}/gfs.{cycle:%Y%m%d}/{cycle:%H}/atmos/gfs.t{cycle:%H}z.pgrb2.0p25.f{fhour:03d}"
+    return source.file_url(source.GFS, cycle, fhour)
 
 
 def idx_url(cycle: datetime, fhour: int) -> str:
-    return file_url(cycle, fhour) + ".idx"
+    return source.idx_url(source.GFS, cycle, fhour)
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,12 @@ def http_get(url: str, byte_range: tuple[int, int | None] | None = None, retries
     raise AssertionError("unreachable")
 
 
+def read(url: str, byte_range: tuple[int, int | None] | None = None) -> bytes:
+    """The byte-range reader of GFS's description. It looks `http_get` up when called, so a test that
+    replaces `gfs.http_get` replaces every read the pipeline makes."""
+    return http_get(url, byte_range)
+
+
 def exists(url: str) -> bool:
     request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
     try:
@@ -111,14 +122,3 @@ def exists(url: str) -> bool:
             return response.status == 200
     except urllib.error.HTTPError:
         return False
-
-
-def latest_complete_cycle(now: datetime, last_hour: int, lookback_cycles: int = 6) -> datetime | None:
-    """The newest run whose last forecast hour is already published."""
-    newest = now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    newest -= timedelta(hours=newest.hour % 6)
-    for k in range(lookback_cycles):
-        cycle = newest - timedelta(hours=6 * k)
-        if exists(idx_url(cycle, last_hour)):
-            return cycle
-    return None

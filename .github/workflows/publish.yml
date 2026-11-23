@@ -3,7 +3,7 @@ name: publish
 on:
   schedule:
     # Hourly, off the top of the hour: GitHub delays or drops scheduled runs at :00 under load.
-    # When there is no new complete GFS run, only the first two steps run.
+    # When no source has a new complete run, only the first two steps run.
     - cron: "17 * * * *"
   workflow_dispatch: {}
 
@@ -19,15 +19,18 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # A normal run takes 2 to 4 minutes; 180 leaves room for a run that builds every source after a
+    # lost cache. A job's timeout cannot read a step's output, so it is 180 in every run.
+    timeout-minutes: 180
     outputs:
       published: ${{ steps.run.outputs.published }}
     steps:
       - uses: actions/checkout@v7
 
       # Standard library only, on the runner's own Python. The URL comes from environment variables,
-      # which every trigger sets (the schedule event payload has no repository object).
-      - name: Is there a new GFS run?
+      # which every trigger sets (the schedule event payload has no repository object). It writes
+      # new, build (the new sources) and all (every source with a complete run) as <name>:<cycle> lists.
+      - name: Is there a new run of any source?
         id: check
         run: python3 -m wxpipe.check --manifest "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/manifest.json"
 
@@ -57,10 +60,17 @@ jobs:
           key: site-${{ github.run_id }}
           restore-keys: site-
 
-      - name: Build the new GFS run
+      # The new sources, or every source with a complete run when the restored site has no readable
+      # manifest; wxpipe.run then says so in the run's summary.
+      - name: Build the new runs
         id: run
         if: steps.check.outputs.new == 'true'
-        run: python -m wxpipe.run --out site --work work --cycle "${{ steps.check.outputs.cycle }}"
+        run: python -m wxpipe.run --out site --work work --cycles "${{ steps.check.outputs.build }}" --all-cycles "${{ steps.check.outputs.all }}"
+
+      # Above the limit it drops what its order allows; if that is not enough it fails, and nothing is uploaded.
+      - name: Size gate
+        if: steps.run.outputs.published == 'true'
+        run: python -m wxpipe.gate --site site
 
       - name: Upload the site
         if: steps.run.outputs.published == 'true'
@@ -81,10 +91,38 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.retry.outputs.page_url || steps.deployment.outputs.page_url }}
     steps:
+      - name: Record the start
+        id: start
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # Only for the summary step; the deploy does not need it.
+      - uses: actions/checkout@v7
+        continue-on-error: true
+        with:
+          sparse-checkout: wxpipe
+
       - id: deployment
         uses: actions/deploy-pages@v5
+        continue-on-error: true
+
+      # One retry after a failed first deploy, a timeout being the expected case. The job fails only
+      # when the retry fails too.
+      - id: retry
+        if: steps.deployment.outcome == 'failure'
+        uses: actions/deploy-pages@v5
+
+      # The job's minutes, attempts and outcome in the run's summary, with a warning from 6 minutes.
+      - name: Deploy summary
+        if: always()
+        continue-on-error: true
+        run: >-
+          python3 -m wxpipe.summary deploy
+          --start "${{ steps.start.outputs.start }}"
+          --end "$(date +%s)"
+          --attempts ${{ steps.deployment.outcome == 'failure' && 2 || 1 }}
+          --outcome ${{ steps.deployment.outcome == 'failure' && steps.retry.outcome || steps.deployment.outcome }}
 
   heartbeat:
     # Scheduled workflows in a public repository stop after 60 days without repository activity.

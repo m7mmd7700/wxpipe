@@ -1,4 +1,7 @@
-"""Tile geometry on the GFS grid, the same rules as RegularLatLonDomain in the app (core:config)."""
+"""Tile geometry on the shared output grid, the same rules as RegularLatLonDomain in the app (core:config).
+
+Decode puts every source on that grid, so the tiles are the same for all sources and take none.
+"""
 
 from __future__ import annotations
 

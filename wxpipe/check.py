@@ -1,9 +1,15 @@
-"""The workflow's cheap first step: is there a complete GFS run that the site does not have yet?
+"""The workflow's cheap first step: which sources have a complete run that the site does not have yet?
 
     python -m wxpipe.check --manifest https://<owner>.github.io/<repo>/manifest.json
 
-Standard library only, so it runs on the runner's own Python before any install. It writes
-`new=true|false` and `cycle=YYYYMMDDHH` to $GITHUB_OUTPUT when that variable is set.
+Standard library only, so it runs on the runner's own Python before any install. It prints one line
+per source and writes to $GITHUB_OUTPUT, when that variable is set:
+
+    new=true|false              true if any source is new
+    build=<name>:<cycle>,...    the new sources
+    all=<name>:<cycle>,...      every source with a complete run, for a site that lost its manifest
+
+An unreadable live manifest counts every source as new.
 """
 
 from __future__ import annotations
@@ -15,16 +21,31 @@ import sys
 import urllib.error
 from datetime import datetime, timezone
 
-from . import gfs
-
-# Last forecast hour of a run; wxpipe.config.FORECAST_HOURS ends here too (checked by a test).
-LAST_HOUR = 384
-SOURCE = "gfs"
+from . import gfs, source
 
 
-def is_new(release: str, live_manifest: dict | None) -> bool:
-    published = (live_manifest or {}).get("sources", {}).get(SOURCE, {}).get("release")
-    return published != release
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def published(name: str, live_manifest: dict | None) -> str | None:
+    entry = ((live_manifest or {}).get("sources") or {}).get(name)
+    return entry.get("release") if isinstance(entry, dict) else None
+
+
+def is_new(name: str, release: str, live_manifest: dict | None) -> bool:
+    return published(name, live_manifest) != release
+
+
+def outputs(found: dict[str, str | None], live_manifest: dict | None) -> dict[str, str]:
+    """$GITHUB_OUTPUT's values from each source's newest complete run (None: no complete run)."""
+    complete = {name: release for name, release in found.items() if release is not None}
+    new = {name: release for name, release in complete.items() if is_new(name, release, live_manifest)}
+    return {
+        "new": "true" if new else "false",
+        "build": ",".join(f"{n}:{r}" for n, r in new.items()),
+        "all": ",".join(f"{n}:{r}" for n, r in complete.items()),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,20 +53,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--manifest", required=True, help="URL of the live manifest.json")
     args = p.parse_args(argv)
 
-    cycle = gfs.latest_complete_cycle(datetime.now(timezone.utc), LAST_HOUR)
-    if cycle is None:
-        print("No complete GFS run found.")
-        _output(new="false")
-        return 0
-    release = f"{cycle:%Y%m%d%H}"
     try:
         live = json.loads(gfs.http_get(args.manifest, retries=2).decode("utf-8"))
+        live = live if isinstance(live, dict) else None
     except (urllib.error.URLError, OSError, ValueError):
         live = None
-    new = is_new(release, live)
-    on_site = (live or {}).get("sources", {}).get(SOURCE, {}).get("release", "nothing")
-    print(f"Newest complete GFS run: {release}; on the site: {on_site}; build: {'yes' if new else 'no'}")
-    _output(new=str(new).lower(), cycle=release)
+    found: dict[str, str | None] = {}
+    for info in source.INFOS:
+        cycle = source.latest_complete_cycle(info, now(), gfs.exists)
+        release = None if cycle is None else f"{cycle:%Y%m%d%H}"
+        found[info.name] = release
+        if release is None:
+            print(f"{info.name}: no complete run found")
+        else:
+            new = is_new(info.name, release, live)
+            print(f"{info.name}: newest complete run {release}; on the site: "
+                  f"{published(info.name, live) or 'nothing'}; build: {'yes' if new else 'no'}")
+    _output(**outputs(found, live))
     return 0
 
 

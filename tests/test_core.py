@@ -13,7 +13,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---- quantisation ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("field", config.FIELDS, ids=lambda f: f.name)
+@pytest.mark.parametrize("field", config.GFS.fields, ids=lambda f: f.name)
 def test_every_field_round_trips_within_half_a_step(field):
     rng = np.random.default_rng(7)
     values = rng.uniform(field.lut.min_value, field.lut.max_value, 20_000)
@@ -120,32 +120,29 @@ def test_accumulation_windows():
 
 
 def test_forecast_hours_cover_sixteen_days():
-    assert len(config.FORECAST_HOURS) == 209
-    assert config.FORECAST_HOURS[120] == 120 and config.FORECAST_HOURS[121] == 123
-    assert config.FORECAST_HOURS[-1] == 384
+    assert len(config.GFS.forecast_hours) == 209
+    assert config.GFS.forecast_hours[120] == 120 and config.GFS.forecast_hours[121] == 123
+    assert config.GFS.forecast_hours[-1] == 384
 
 
-def test_the_cheap_check_agrees_with_the_config():
-    from wxpipe import check
+def test_the_cheap_check_agrees_with_the_config(monkeypatch):
+    from wxpipe import check, source
 
-    assert check.LAST_HOUR == config.FORECAST_HOURS[-1]
-    assert check.SOURCE == config.SOURCE
-    assert check.is_new("2026110712", None)
-    assert check.is_new("2026110712", {"sources": {"gfs": {"release": "2026110706"}}})
-    assert not check.is_new("2026110712", {"sources": {"gfs": {"release": "2026110712"}}})
+    def refuse(*args, **kwargs):
+        raise AssertionError("a request was made")
+
+    monkeypatch.setattr(gfs, "http_get", refuse)
+    monkeypatch.setattr(gfs, "exists", refuse)
+
+    assert source.GFS.last_hour == config.GFS.forecast_hours[-1]
+    assert source.GFS.name == config.GFS.info.name == "gfs"
+    assert check.is_new("gfs", "2026110712", None)
+    assert check.is_new("gfs", "2026110712", {"sources": {"gfs": {"release": "2026110706"}}})
+    assert not check.is_new("gfs", "2026110712", {"sources": {"gfs": {"release": "2026110712"}}})
 
 
-def test_the_cheap_check_imports_no_third_party_package():
-    import ast
-
-    source = (Path(__file__).resolve().parents[1] / "wxpipe" / "gfs.py").read_text(encoding="utf-8")
-    source += (Path(__file__).resolve().parents[1] / "wxpipe" / "check.py").read_text(encoding="utf-8")
-    imported = {
-        (node.module or "").split(".")[0] if isinstance(node, ast.ImportFrom) else alias.name.split(".")[0]
-        for node in ast.walk(ast.parse(source)) if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
-    assert not imported & {"numpy", "eccodes"}
+# The import test of the cheap check, which parsed gfs.py and check.py, is replaced by the subprocess
+# test in tests/test_check.py, which blocks numpy and eccodes and imports every standard-library module.
 
 
 # ---- precipitation --------------------------------------------------------------------------

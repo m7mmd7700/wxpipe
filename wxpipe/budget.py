@@ -1,4 +1,9 @@
-"""Measures a built release and scales it to a full run: python -m wxpipe.budget site [--frames 209]."""
+"""Measures a source's built release and scales it to a full run, a local estimate tool:
+
+    python -m wxpipe.budget site [--source gfs] [--frames 209]
+
+The size gate of the workflow is `wxpipe.gate`, not this.
+"""
 
 from __future__ import annotations
 
@@ -45,15 +50,22 @@ def scale(stats: dict, frames: int) -> dict:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="wxpipe.budget")
     p.add_argument("site", type=Path)
-    p.add_argument("--frames", type=int, default=len(config.FORECAST_HOURS))
+    p.add_argument("--source", default="gfs", help="the source whose current release is measured")
+    p.add_argument("--frames", type=int, help="frames to scale to; default: all of the source's forecast hours")
     p.add_argument("--keep", type=int, default=2)
     args = p.parse_args(argv)
+    try:
+        src = config.source(args.source)
+    except KeyError:
+        p.error(f"unknown source {args.source!r}")
+    if args.frames is None:
+        args.frames = len(src.forecast_hours)
     manifest = json.loads((args.site / "manifest.json").read_text(encoding="utf-8"))
-    release = manifest["sources"][config.SOURCE]
+    release = manifest["sources"][src.info.name]
     stats = measure(args.site / release["path"])
     full = scale(stats, args.frames)
     levels = [lv.size.replace("/", "-") for lv in config.LEVELS]
-    print(f"Measured {release['release']} ({len(release['frames'])} frames), scaled to {args.frames} frames, MB:")
+    print(f"Measured {src.info.name} {release['release']} ({len(release['frames'])} frames), scaled to {args.frames} frames, MB:")
     print(f"{'field':20}" + "".join(f"{lv:>12}" for lv in levels) + f"{'total':>10}")
     grand = 0.0
     for field, by_level in full.items():

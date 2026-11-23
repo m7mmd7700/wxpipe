@@ -2,4 +2,5 @@ work/
 site/
 __pycache__/
 .pytest_cache/
+.pytest-tmp/
 *.pyc

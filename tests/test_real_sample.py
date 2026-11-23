@@ -20,20 +20,30 @@ HOUR = 1
 pytestmark = pytest.mark.skipif(not (SAMPLE / f"f{HOUR:03d}.idx").exists(), reason="GFS sample not downloaded")
 
 
+@pytest.fixture(autouse=True)
+def no_requests(monkeypatch):
+    """A cached message that is missing fails the test instead of being downloaded."""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"a request was made: {args!r}")
+
+    monkeypatch.setattr(gfs, "http_get", refuse)
+    monkeypatch.setattr(gfs, "exists", refuse)
+
+
 @pytest.mark.parametrize("name", ["temperature.2m", "wind_u.10m", "pressure.msl", "cloud.total"])
 def test_tiles_round_trip_to_the_grib_values(name, tmp_path):
     from wxpipe import grib
 
-    field = config.field(name)
+    field = config.GFS.field(name)
     cycle = parse_cycle(CYCLE)
-    fetcher = Fetcher(cycle, ROOT / "work")
+    fetcher = Fetcher(config.GFS, cycle, ROOT / "work")
     idx = {HOUR: fetcher.idx(HOUR)}
     record = gfs.instant_record(idx[HOUR], field.grib, HOUR)
-    truth = grib.decode((SAMPLE / f"f{HOUR:03d}" / f"{record.number}.grib2").read_bytes()) * field.scale + field.offset
+    truth = grib.decode((SAMPLE / f"f{HOUR:03d}" / f"{record.number}.grib2").read_bytes(), config.GFS) * field.scale + field.offset
     assert np.isfinite(truth).all()
 
-    frames = build_instant(field, cycle, (HOUR,), idx, fetcher)
-    write_field(tmp_path, field, CYCLE, frames)
+    frames = build_instant(config.GFS, field, cycle, (HOUR,), idx, fetcher)
+    write_field(tmp_path, config.GFS, field, CYCLE, frames)
     checked = 0
     for level in config.LEVELS:
         for tile in tiles.tiles_for(level):
@@ -51,10 +61,10 @@ def test_tiles_round_trip_to_the_grib_values(name, tmp_path):
 def test_grid_orientation_puts_riyadh_where_the_app_expects_it():
     from wxpipe import grib
 
-    field = config.field("temperature.2m")
-    idx = Fetcher(parse_cycle(CYCLE), ROOT / "work").idx(HOUR)
+    field = config.GFS.field("temperature.2m")
+    idx = Fetcher(config.GFS, parse_cycle(CYCLE), ROOT / "work").idx(HOUR)
     record = gfs.instant_record(idx, field.grib, HOUR)
-    grid = grib.decode((SAMPLE / f"f{HOUR:03d}" / f"{record.number}.grib2").read_bytes()) - 273.15
+    grid = grib.decode((SAMPLE / f"f{HOUR:03d}" / f"{record.number}.grib2").read_bytes(), config.GFS) - 273.15
     # Row 0 is 90N; Riyadh (24.7N, 46.7E) sits near row 261, column 187. In November, mid-afternoon there
     # (13 UTC, hour 1 of the 12z run) is warm, and the polar row is far colder.
     riyadh = grid[round((90 - 24.7) / 0.25), round(46.7 / 0.25)]
