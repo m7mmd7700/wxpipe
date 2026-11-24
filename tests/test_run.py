@@ -2,16 +2,21 @@
 and the outputs."""
 
 import dataclasses
+import email.message
 import json
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from wxpipe import config, ecmwf, gfs, grib, run, site
+from wxpipe import config, ecmwf, gfs, grib, run, site, source
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REAL_HTTP_GET = ecmwf.http_get   # taken before the autouse fixture replaces it
 HOURS = (0, 6, 7, 120, 384)
 CYCLE = "2026110712"
 IFS_CYCLE = "2026112312"
@@ -46,7 +51,9 @@ def no_requests(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "probe", refuse)   # a test with an ifs job names its own probe
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output.txt"))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    ecmwf.reads_reset()   # each test starts on IFS's first copy with no counts
     yield tmp_path
+    ecmwf.reads_reset()
     assert made == [], f"requests were made: {made!r}"
 
 
@@ -708,7 +715,7 @@ def test_the_ifs_cache_paths_and_reads(no_requests, monkeypatch):
     assert t2m.number == 58
     data = fetcher.messages([(150, t2m)])[(150, 58)]
     assert len(data) == 321810
-    base = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com/20261123/12z/ifs/0p25/oper/20261123120000-150h-oper-fc"
+    base = "https://data.ecmwf.int/forecasts/20261123/12z/ifs/0p25/oper/20261123120000-150h-oper-fc"
     assert asked == [(base + ".index", None), (base + ".grib2", (25137435, 25137435 + 321810 - 1))]
     assert (tmp / "work" / "ifs" / IFS_CYCLE / "f150.idx").is_file()
     assert (tmp / "work" / "ifs" / IFS_CYCLE / "f150" / "58.grib2").stat().st_size == 321810
@@ -1067,3 +1074,248 @@ def test_a_failed_move_on_a_rerun_keeps_the_old_release(no_requests, monkeypatch
     assert tree(out) == before
     assert json.loads((out / "manifest.json").read_text(encoding="utf-8"))["sources"]["gfs"]["path"] == f"gfs/{CYCLE}"
     assert not (work / "stage" / "gfs" / f"{CYCLE}.old").exists() and not stage.exists()
+
+
+# ---- the mirror fix: IFS's copies through run.main (B7) ----------------------------------------------
+
+PORTAL, CLOUDFRONT, BUCKET = source.IFS.copies
+HOSTS = [root.removeprefix("https://") for root in source.IFS.copies]
+
+
+def grib2(n: int) -> bytes:
+    """A made-up GRIB2 message of [n] bytes whose markers, edition and length field pass the reads' check."""
+    return b"GRIB" + b"\0\0\0" + b"\x02" + n.to_bytes(8, "big") + b"\0" * (n - 20) + b"7777"
+
+
+class Served:
+    def __init__(self, status: int, body: bytes):
+        self.status, self.body = status, body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def slowdown(url: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, 503, "SlowDown", email.message.Message(), None)
+
+
+def ifs_copies(monkeypatch, refusing=(PORTAL,)) -> dict:
+    """The real ecmwf.http_get, with urlopen replaced by copies that answer "503 SlowDown" when their ROOT
+    is in [refusing], and otherwise serve the IFS fixtures and made-up messages of each asked length;
+    time.sleep records its waits. Returns the requests per ROOT and the waits."""
+    seen = {PORTAL: 0, CLOUDFRONT: 0, BUCKET: 0, "waits": []}
+
+    def urlopen(request, timeout=None):
+        url = request.full_url
+        root = next(r for r in (PORTAL, CLOUDFRONT, BUCKET) if url.startswith(r))
+        seen[root] += 1
+        if root in refusing:
+            raise slowdown(url)
+        if url.endswith(".index"):
+            return Served(200, ifs_text(int(url.rsplit("-", 3)[-3].rstrip("h"))).encode("utf-8"))
+        start, end = (int(v) for v in request.get_header("Range").removeprefix("bytes=").split("-"))
+        return Served(206, grib2(end - start + 1))
+
+    monkeypatch.setattr(ecmwf, "http_get", REAL_HTTP_GET)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(time, "sleep", seen["waits"].append)
+    return seen
+
+
+def ifs_with(monkeypatch, **changes) -> None:
+    """IFS's entry of config.SOURCES, as gfs_and_ifs set it, with [changes]."""
+    monkeypatch.setattr(config, "SOURCES", tuple(
+        dataclasses.replace(s, **changes) if s.info.name == "ifs" else s for s in config.SOURCES))
+
+
+def summary_of(tmp: Path) -> list[str]:
+    return (tmp / "summary.md").read_text(encoding="utf-8").splitlines()
+
+
+def test_an_ifs_job_whose_first_copy_refuses_is_built_from_the_second(no_requests, monkeypatch, capsys):
+    # B7: one read at a time, so every count is exact.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work, seed_ifs=False)
+    ifs_with(monkeypatch, workers=1)
+    ifs_reads_messages(monkeypatch)
+    seen = ifs_copies(monkeypatch)
+    before = site_with_gfs_and_ifs(out)
+    assert run_ifs_alone(out, work) == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"]["ifs"]["release"] == IFS_CYCLE and manifest["sources"]["gfs"] == before["sources"]["gfs"]
+    # The first read is refused 4 times on the portal, then every read is on CloudFront.
+    idx = ifs_index()
+    records = [config.IFS.instant_record(idx[h], key, h) for key in ("2t:sfc", "10u:sfc") for h in IFS_HOURS]
+    size = sum(len(ifs_text(h).encode("utf-8")) for h in IFS_HOURS) + sum(r.end - r.offset + 1 for r in records)
+    assert (seen[PORTAL], seen[CLOUDFRONT], seen[BUCKET], seen["waits"]) == (4, 9, 0, [5, 10, 20])
+    reads = (f"**Reads:** ifs {IFS_CYCLE}: {HOSTS[0]} 4 requests, 4 refused, 0 missing, 0 errors, 0 files, 0.0 MB; "
+             f"{HOSTS[1]} 9 requests, 0 refused, 0 missing, 0 errors, 9 files, {size / 1e6:.1f} MB; "
+             f"{HOSTS[2]} 0 requests, 0 refused, 0 missing, 0 errors, 0 files, 0.0 MB")
+    lines = summary_of(tmp)
+    built = next(k for k, line in enumerate(lines) if line.startswith(f"- ifs {IFS_CYCLE}: 3 frames, 2 fields"))
+    assert lines[built + 1] == f"- {reads}"
+    printed = capsys.readouterr().out.splitlines()
+    assert f"ifs reads: moved from {HOSTS[0]} to {HOSTS[1]}: HTTPError: HTTP Error 503: SlowDown" in printed
+    assert reads in printed
+
+
+def test_an_ifs_job_failing_on_every_copy_writes_its_line_after_skipped(no_requests, monkeypatch, capsys):
+    # B7: two workers, so only the line's place and hosts are asserted.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work, ifs_first=True, seed_ifs=False)
+    ifs_copies(monkeypatch, refusing=(PORTAL, CLOUDFRONT, BUCKET))
+    before = site_with_gfs_and_ifs(out)
+    assert run_both(out, work) == 0
+    assert_ifs_skipped_and_gfs_published(tmp, out, work, before, capsys.readouterr().out,
+                                         f"OSError: every copy failed: {HOSTS[0]}: HTTPError: HTTP Error 503: SlowDown; "
+                                         f"{HOSTS[1]}: HTTPError")
+    lines = summary_of(tmp)
+    skipped = next(k for k, line in enumerate(lines) if line.startswith(f"**Skipped:** ifs {IFS_CYCLE}: "))
+    assert lines[skipped + 1] == ""   # its own paragraph
+    reads = lines[skipped + 2]
+    assert reads.startswith(f"**Reads:** ifs {IFS_CYCLE}: {HOSTS[0]} ")
+    assert reads.index(HOSTS[0]) < reads.index(HOSTS[1]) < reads.index(HOSTS[2])
+    assert all(f"{h} 0 requests" not in reads for h in HOSTS)
+
+
+def test_an_ifs_job_past_its_read_limit_writes_its_line_after_skipped(no_requests, monkeypatch):
+    # B7.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work, ifs_first=True)
+    now = {"t": 1000.0}
+    monkeypatch.setattr(run, "clock", lambda: now["t"])
+    monkeypatch.setattr(run, "probe", lambda src: now.update(t=now["t"] + 45 * 60 + 1))
+    site_with_gfs_and_ifs(out)
+    # A count left from before the job: the job's start zeroes it.
+    REAL_HTTP_GET(PORTAL + "/x.txt", opener=lambda request, timeout=None: Served(200, b"x"), wait=None)
+    assert ecmwf.reads_counts(PORTAL)["requests"] == 1
+    assert run_both(out, work) == 0
+    lines = summary_of(tmp)
+    skipped = next(k for k, line in enumerate(lines) if line.startswith(f"**Skipped:** ifs {IFS_CYCLE}: read time limit"))
+    assert lines[skipped + 1] == ""
+    assert lines[skipped + 2] == (f"**Reads:** ifs {IFS_CYCLE}: " + "; ".join(
+        f"{h} 0 requests, 0 refused, 0 missing, 0 errors, 0 files, 0.0 MB" for h in HOSTS))
+
+
+def test_a_refused_run_holds_the_ifs_line_before_refused(no_requests, monkeypatch):
+    # B7.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work, ifs_drop={("360", "10u")})
+    text = fixture_text(6)
+    (work / "gfs" / CYCLE / "f006.idx").write_bytes(
+        ("\n".join(line for line in text.splitlines() if ":TMP:2 m above ground:6 hour fcst:" not in line) + "\n").encode())
+    site_with_gfs_and_ifs(out)
+    with pytest.raises(run.RunRefused):
+        run_both(out, work)
+    lines = summary_of(tmp)
+    skipped = next(k for k, line in enumerate(lines) if line.startswith(f"**Skipped:** ifs {IFS_CYCLE}: "))
+    refused = next(k for k, line in enumerate(lines) if line.startswith("**Refused:** "))
+    assert lines[skipped + 1] == ""
+    assert lines[skipped + 2].startswith(f"**Reads:** ifs {IFS_CYCLE}: {HOSTS[0]} 0 requests") and skipped + 2 < refused
+    assert sum(line.startswith("**Reads:**") for line in lines) == 1
+
+
+def test_a_lost_cache_refused_after_ifs_is_built_holds_its_line_before_refused(no_requests, monkeypatch):
+    # B7, F4 (D16): no manifest on the site, GFS with a gap, IFS good and built, the run refused.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work)
+    text = fixture_text(7)
+    (work / "gfs" / CYCLE / "f007.idx").write_bytes(
+        ("\n".join(line for line in text.splitlines() if ":TMP:2 m above ground:7 hour fcst:" not in line) + "\n").encode())
+    out.mkdir()
+    with pytest.raises(run.RunRefused, match="GFS was not built"):
+        run.main(["--out", str(out), "--work", str(work), "--cycles", "", "--all-cycles", BOTH])
+    lines = summary_of(tmp)
+    reads = next(k for k, line in enumerate(lines) if line.startswith(f"**Reads:** ifs {IFS_CYCLE}: {HOSTS[0]} "))
+    refused = next(k for k, line in enumerate(lines) if line.startswith("**Refused:** "))
+    assert lines[reads - 1] == "" and reads < refused
+    assert sum(line.startswith("**Reads:**") for line in lines) == 1
+    assert not (out / "manifest.json").exists()
+
+
+def test_an_ifs_job_dropped_before_its_prepare_writes_no_line(no_requests, monkeypatch, capsys):
+    # B7: the site already holds a later ifs release.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work)
+    site_with_gfs_and_ifs(out)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    manifest["sources"]["ifs"] = {"release": "2026112400", "path": "ifs/2026112400"}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    with pytest.raises(run.RunRefused, match="every source skipped"):
+        run_ifs_alone(out, work)
+    text = (tmp / "summary.md").read_text(encoding="utf-8")
+    assert "the site already holds the later release 2026112400" in text
+    assert "**Reads:**" not in text and "**Reads:**" not in capsys.readouterr().out
+
+
+def test_a_reads_report_that_raises_gives_the_not_available_line(no_requests, monkeypatch, capsys):
+    # B7: the run goes on and publishes.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work)
+
+    def broken(name, release):
+        raise RuntimeError("no counts")
+
+    ifs_with(monkeypatch, reads_report=broken)
+    site_with_gfs_and_ifs(out)
+    assert run_ifs_alone(out, work) == 0
+    lines = summary_of(tmp)
+    built = next(k for k, line in enumerate(lines) if line.startswith(f"- ifs {IFS_CYCLE}: "))
+    assert lines[built + 1] == f"- **Reads:** ifs {IFS_CYCLE}: not available: RuntimeError: no counts"
+    assert json.loads((out / "manifest.json").read_text(encoding="utf-8"))["sources"]["ifs"]["release"] == IFS_CYCLE
+    assert (tmp / "output.txt").read_text(encoding="utf-8") == f"published=true\nrelease={IFS_CYCLE}\n"
+
+
+def test_a_gfs_job_writes_no_reads_line(no_requests, monkeypatch, capsys):
+    # B7: GFS built and published as before, with no line.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work)
+    site_with_gfs_and_ifs(out)
+    assert run_both(out, work) == 0
+    assert json.loads((out / "manifest.json").read_text(encoding="utf-8"))["sources"]["gfs"]["release"] == CYCLE
+    text = (tmp / "summary.md").read_text(encoding="utf-8")
+    assert f"- gfs {CYCLE}: 3 frames, 1 fields" in text
+    assert "**Reads:**" not in text and "**Reads:**" not in capsys.readouterr().out
+
+
+def test_the_local_form_discovers_ifs_on_the_second_copy(no_requests, monkeypatch, capsys):
+    # B7: --source ifs with no --cycle; the first copy's existence test raises, the second answers.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    gfs_and_ifs(monkeypatch, work, seed_ifs=False)
+    asked = []
+
+    def exists(url):
+        asked.append(url)
+        if url.startswith(PORTAL):
+            raise TimeoutError("timed out")
+        return url.startswith(CLOUDFRONT)
+
+    monkeypatch.setattr(gfs, "exists", exists)
+    ifs_mirror(monkeypatch, {"t": 0.0})
+    assert run.main(["--out", str(out), "--work", str(work), "--source", "ifs",
+                     "--hours", "0,150,360", "--fields", "temperature.2m"]) == 0
+    assert len(asked) == 2 and asked[0].startswith(PORTAL) and asked[1] == CLOUDFRONT + asked[0][len(PORTAL):]
+    assert asked[1].endswith("-360h-oper-fc.index")
+    day, hour = asked[1][len(CLOUDFRONT) + 1:].split("/")[:2]
+    built = sorted(p.name for p in (out / "ifs").iterdir())
+    assert built == [day + hour.removesuffix("z")]
+    assert (out / "ifs" / built[0] / "temperature.2m").is_dir()
+    # F6: the copy passed over, and the copy that decided the newest cycle.
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[:2] == [f"ifs discovery: {HOSTS[0]} passed over: TimeoutError: timed out",
+                           f"ifs discovery: the newest cycle decided by {HOSTS[1]}: true"]

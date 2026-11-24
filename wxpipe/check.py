@@ -11,8 +11,11 @@ per source and writes to $GITHUB_OUTPUT, when that variable is set:
 
 A source is new when its newest complete run is later than the live one, so a discovery that falls
 back to an older cycle never replaces a newer release. An unreadable live manifest, a source absent
-from it, or a live release that is not a YYYYMMDDHH string counts the source as new. One source's
-discovery error is printed with its name and counts as no complete run for that source alone.
+from it, or a live release that is not a YYYYMMDDHH string counts the source as new. A source with
+several copies asks them in order, and the first copy that answers true or false decides; each copy
+passed over is printed, and so is the copy that decided the newest cycle. One source's discovery
+error, raised only when every copy raised, is printed with its name and counts as no complete run
+for that source alone.
 """
 
 from __future__ import annotations
@@ -71,12 +74,15 @@ def main(argv: list[str] | None = None) -> int:
         live = None
     found: dict[str, str | None] = {}
     for info in source.INFOS:
+        on_copies = source.exists_on_copies(info, gfs.exists)
         try:
-            cycle = source.latest_complete_cycle(info, now(), gfs.exists)
+            cycle = source.latest_complete_cycle(info, now(), on_copies)
         except Exception as e:   # one source's discovery error stays its own
+            _discovery_line(info, on_copies)
             print(f"::warning::{info.name}: discovery failed, no complete run counted: {type(e).__name__}: {e}")
             found[info.name] = None
             continue
+        _discovery_line(info, on_copies)
         release = None if cycle is None else f"{cycle:%Y%m%d%H}"
         found[info.name] = release
         if release is None:
@@ -87,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
                   f"{published(info.name, live) or 'nothing'}; build: {'yes' if new else 'no'}")
     _output(**outputs(found, live))
     return 0
+
+
+def _discovery_line(info: source.SourceInfo, on_copies) -> None:
+    """Prints, for a source of several copies, which copy decided its newest cycle."""
+    line = source.discovery_line(info, on_copies)
+    if line is not None:
+        print(line)
 
 
 def _output(**values: str) -> None:

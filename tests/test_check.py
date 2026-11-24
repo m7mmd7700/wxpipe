@@ -179,15 +179,17 @@ def test_one_sources_discovery_error_leaves_the_other(offline, monkeypatch, caps
     complete = source.idx_url(source.GFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), source.GFS.last_hour)
 
     def exists(url):
-        if url.startswith(source.IFS.base_url):
+        if any(url.startswith(root) for root in source.roots(source.IFS)):   # every IFS copy raises
             raise ConnectionError("connection reset")
         return url == complete
 
     monkeypatch.setattr(gfs, "exists", exists)
     assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
     assert outputs_of(output) == {"new": "true", "build": f"gfs:{NEWEST}", "all": f"gfs:{NEWEST}"}
+    printed = capsys.readouterr().out
     assert ("::warning::ifs: discovery failed, no complete run counted: ConnectionError: connection reset"
-            in capsys.readouterr().out)
+            in printed)
+    assert "ifs discovery: the newest cycle: every copy raised\n" in printed   # F6 (c)
 
     # And the other way round: GFS's error leaves IFS's run as it would be.
     ifs_complete = source.idx_url(source.IFS, datetime(2026, 11, 7, 12, tzinfo=timezone.utc), 360)
@@ -201,6 +203,60 @@ def test_one_sources_discovery_error_leaves_the_other(offline, monkeypatch, caps
     output.unlink()
     assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
     assert outputs_of(output) == {"new": "true", "build": "ifs:2026110712", "all": "ifs:2026110712"}
+
+
+def test_a_non_read_error_on_a_copy_stops_that_sources_discovery(offline, monkeypatch, capsys):
+    # F6 (a): not an OSError nor an HTTPException, so the other copies are not asked; GFS goes on.
+    live, output = offline
+    gfs_complete = source.idx_url(source.GFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), source.GFS.last_hour)
+    asked = []
+
+    def exists(url):
+        asked.append(url)
+        if url.startswith(source.IFS.base_url):
+            raise RuntimeError("a bug")
+        return url == gfs_complete
+
+    monkeypatch.setattr(gfs, "exists", exists)
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output) == {"new": "true", "build": f"gfs:{NEWEST}", "all": f"gfs:{NEWEST}"}
+    printed = capsys.readouterr().out
+    assert "::warning::ifs: discovery failed, no complete run counted: RuntimeError: a bug" in printed
+    assert "passed over" not in printed
+    assert [u for u in asked if not u.startswith(source.GFS.base_url)] == [
+        source.idx_url(source.IFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), 360)]
+
+
+def test_ifs_newest_run_found_on_the_second_copy(offline, monkeypatch, capsys):
+    # B8: the first copy raises, the second has the run; GFS's lines and outputs as without copies.
+    live, output = offline
+    live["body"] = json.dumps({"sources": {"gfs": {"release": "2026110718"}, "ifs": {"release": "2026110700"}}}).encode()
+    gfs_complete = source.idx_url(source.GFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), source.GFS.last_hour)
+    ifs_complete = source.idx_url(source.IFS, datetime(2026, 11, 7, 12, tzinfo=timezone.utc), 360)
+    portal, cloudfront = source.IFS.copies[:2]
+    asked = []
+
+    def exists(url):
+        asked.append(url)
+        if url.startswith(portal):
+            raise TimeoutError("timed out")
+        if url.startswith(cloudfront):
+            return url == cloudfront + ifs_complete[len(portal):]
+        return url == gfs_complete
+
+    monkeypatch.setattr(gfs, "exists", exists)
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output) == {"new": "true", "build": f"gfs:{NEWEST},ifs:2026110712",
+                                  "all": f"gfs:{NEWEST},ifs:2026110712"}
+    printed = capsys.readouterr().out
+    portal_label, cloudfront_label = (r.removeprefix("https://") for r in (portal, cloudfront))
+    assert printed.splitlines() == [
+        f"gfs: newest complete run {NEWEST}; on the site: 2026110718; build: yes",
+        f"ifs discovery: {portal_label} passed over: TimeoutError: timed out",
+        f"ifs discovery: {portal_label} passed over: TimeoutError: timed out",
+        f"ifs discovery: the newest cycle decided by {cloudfront_label}: false",
+        "ifs: newest complete run 2026110712; on the site: 2026110700; build: yes"]
+    assert [u for u in asked if u.startswith(source.GFS.base_url)] == [gfs_complete]
 
 
 class Answer:

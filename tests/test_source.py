@@ -99,7 +99,9 @@ def test_both_parts_list_the_same_sources():
 
 # ---- IFS -------------------------------------------------------------------------------------
 
-MIRROR = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
+MIRROR = "https://data.ecmwf.int/forecasts"   # the first copy's ROOT, ECMWF's data portal
+CLOUDFRONT = "https://d2zvc0wgha4k2l.cloudfront.net"
+BUCKET = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
 
 
 def test_ifs_urls():
@@ -114,6 +116,166 @@ def test_ifs_urls():
     assert source.idx_url(source.IFS, c12, 0).endswith("/20261123120000-0h-oper-fc.index")
     # GFS's file has no suffix of its own.
     assert source.GFS.file_suffix == ""
+
+
+def test_ifs_copies_and_their_urls():
+    # B1: the three copies in order, the first the base URL; GFS has one.
+    assert source.IFS.copies == (MIRROR, CLOUDFRONT, BUCKET)
+    assert source.IFS.copies[0] == source.IFS.base_url
+    assert source.roots(source.IFS) == source.IFS.copies
+    assert source.GFS.copies == () and source.roots(source.GFS) == (source.GFS.base_url,)
+    path = "/20261123/12z/ifs/0p25/oper/20261123120000-360h-oper-fc"
+    c12 = datetime(2026, 11, 23, 12, tzinfo=timezone.utc)
+    for suffix, url in ((".grib2", source.file_url(source.IFS, c12, 360)), (".index", source.idx_url(source.IFS, c12, 360))):
+        assert url == MIRROR + path + suffix
+        assert [source.on_root(source.IFS, url, root) for root in source.roots(source.IFS)] == [
+            MIRROR + path + suffix, CLOUDFRONT + path + suffix, BUCKET + path + suffix]
+    with pytest.raises(ValueError, match="is not on"):
+        source.on_root(source.IFS, BUCKET + path + ".index", CLOUDFRONT)
+    with pytest.raises(ValueError, match="is not on"):
+        source.on_root(source.IFS, "https://example.invalid/a.index", MIRROR)
+    gfs_url = source.idx_url(source.GFS, CYCLE, 7)
+    assert source.on_root(source.GFS, gfs_url, source.GFS.base_url) == gfs_url
+
+
+# ---- M5: discovery over the copies ----------------------------------------------------------------
+
+def recording(answers: dict):
+    """An existence test that answers by each URL's ROOT, from [answers]: True, False or an exception."""
+    asked = []
+
+    def exists(url):
+        asked.append(url)
+        for root, answer in answers.items():
+            if url.startswith(root):
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+        raise AssertionError(f"no answer for {url}")
+
+    exists.asked = asked
+    return exists
+
+
+def test_exists_on_copies_the_first_definite_answer_decides():
+    # B2.
+    url = source.idx_url(source.IFS, datetime(2026, 11, 23, 12, tzinfo=timezone.utc), 360)
+    path = url[len(MIRROR):]
+    for answer in (True, False):
+        exists = recording({MIRROR: answer, CLOUDFRONT: AssertionError("asked"), BUCKET: AssertionError("asked")})
+        assert source.exists_on_copies(source.IFS, exists)(url) is answer
+        assert exists.asked == [url]
+        exists = recording({MIRROR: ConnectionError("reset"), CLOUDFRONT: TimeoutError("t"), BUCKET: answer})
+        assert source.exists_on_copies(source.IFS, exists)(url) is answer
+        assert exists.asked == [MIRROR + path, CLOUDFRONT + path, BUCKET + path]
+    exists = recording({MIRROR: ConnectionError("reset"), CLOUDFRONT: TimeoutError("t"), BUCKET: OSError("o")})
+    with pytest.raises(ConnectionError, match="reset"):
+        source.exists_on_copies(source.IFS, exists)(url)
+    assert len(exists.asked) == 3
+
+
+def test_exists_on_copies_passes_over_read_errors_only():
+    # F6 (a): an OSError or an http.client.HTTPException is passed over; anything else is raised at once.
+    import http.client
+
+    url = source.idx_url(source.IFS, datetime(2026, 11, 23, 12, tzinfo=timezone.utc), 360)
+    exists = recording({MIRROR: http.client.RemoteDisconnected("closed"), CLOUDFRONT: True, BUCKET: False})
+    assert source.exists_on_copies(source.IFS, exists)(url) is True
+    exists = recording({MIRROR: http.client.IncompleteRead(b"x"), CLOUDFRONT: False, BUCKET: True})
+    assert source.exists_on_copies(source.IFS, exists)(url) is False
+    exists = recording({MIRROR: RuntimeError("a bug"), CLOUDFRONT: True, BUCKET: True})
+    with pytest.raises(RuntimeError, match="a bug"):
+        source.exists_on_copies(source.IFS, exists)(url)
+    assert exists.asked == [url]
+
+
+def test_exists_on_copies_prints_each_copy_passed_over(capsys):
+    # F6 (b): one line per copy passed over, for a source of several copies; none for GFS's one.
+    url = source.idx_url(source.IFS, datetime(2026, 11, 23, 12, tzinfo=timezone.utc), 360)
+    exists = recording({MIRROR: TimeoutError("timed out"), CLOUDFRONT: ConnectionError("reset"), BUCKET: True})
+    assert source.exists_on_copies(source.IFS, exists)(url) is True
+    assert capsys.readouterr().out.splitlines() == [
+        "ifs discovery: data.ecmwf.int/forecasts passed over: TimeoutError: timed out",
+        "ifs discovery: d2zvc0wgha4k2l.cloudfront.net passed over: ConnectionError: reset"]
+
+    def raises(u):
+        raise TimeoutError("timed out")
+
+    with pytest.raises(TimeoutError):
+        source.exists_on_copies(source.GFS, raises)(source.idx_url(source.GFS, CYCLE, 384))
+    assert capsys.readouterr().out == ""
+
+
+def test_the_discovery_line_names_the_copy_that_decided_the_newest_cycle():
+    # F6 (c).
+    now = datetime(2026, 11, 24, 9, 41, tzinfo=timezone.utc)   # the newest 12-hourly cycle is 2026112400
+    older = source.idx_url(source.IFS, datetime(2026, 11, 23, 12, tzinfo=timezone.utc), 360)
+
+    def portal_false(url):
+        if url.startswith(MIRROR):
+            return url == older
+        raise AssertionError("asked")
+
+    on_copies = source.exists_on_copies(source.IFS, portal_false)
+    source.latest_complete_cycle(source.IFS, now, on_copies)
+    assert source.discovery_line(source.IFS, on_copies) == (
+        "ifs discovery: the newest cycle decided by data.ecmwf.int/forecasts: false")
+
+    on_copies = source.exists_on_copies(source.IFS, recording({MIRROR: OSError("o"), CLOUDFRONT: True, BUCKET: True}))
+    source.latest_complete_cycle(source.IFS, now, on_copies)
+    assert source.discovery_line(source.IFS, on_copies) == (
+        "ifs discovery: the newest cycle decided by d2zvc0wgha4k2l.cloudfront.net: true")
+
+    on_copies = source.exists_on_copies(source.IFS, recording({MIRROR: OSError("o"), CLOUDFRONT: OSError("o"),
+                                                               BUCKET: TimeoutError("t")}))
+    with pytest.raises(OSError):
+        source.latest_complete_cycle(source.IFS, now, on_copies)
+    assert source.discovery_line(source.IFS, on_copies) == "ifs discovery: the newest cycle: every copy raised"
+
+    # Nothing for GFS's one copy, or before anything was asked.
+    on_copies = source.exists_on_copies(source.GFS, lambda u: True)
+    source.latest_complete_cycle(source.GFS, now, on_copies)
+    assert source.discovery_line(source.GFS, on_copies) is None
+    assert source.discovery_line(source.IFS, source.exists_on_copies(source.IFS, lambda u: True)) is None
+
+
+def test_ifs_discovery_over_the_copies():
+    # B2: a run found on the bucket when the portal raises; the older cycle when the portal says
+    # "not there" for the newest and the later copies raise.
+    now = datetime(2026, 11, 24, 9, 41, tzinfo=timezone.utc)   # the newest 12-hourly cycle is 2026112400
+    c24, c23 = (datetime(2026, 11, 24, 0, tzinfo=timezone.utc), datetime(2026, 11, 23, 12, tzinfo=timezone.utc))
+    newest = source.idx_url(source.IFS, c24, 360)[len(MIRROR):]
+    older = source.idx_url(source.IFS, c23, 360)[len(MIRROR):]
+
+    def portal_raises(url):
+        if url.startswith(MIRROR) or url.startswith(CLOUDFRONT):
+            raise ConnectionError("reset")
+        return url == BUCKET + newest
+
+    assert source.latest_complete_cycle(source.IFS, now, source.exists_on_copies(source.IFS, portal_raises)) == c24
+
+    def later_copies_raise(url):
+        if url.startswith(MIRROR):
+            return url == MIRROR + older
+        raise TimeoutError("timed out")
+
+    assert source.latest_complete_cycle(source.IFS, now, source.exists_on_copies(source.IFS, later_copies_raise)) == c23
+
+
+def test_gfs_discovery_answers_as_exists_alone():
+    # B2: GFS's one copy.
+    url = source.idx_url(source.GFS, CYCLE, 384)
+    for answer in (True, False):
+        assert source.exists_on_copies(source.GFS, lambda u: answer)(url) is answer
+
+    def raises(u):
+        raise TimeoutError("timed out")
+
+    with pytest.raises(TimeoutError):
+        source.exists_on_copies(source.GFS, raises)(url)
+    asked = []
+    source.exists_on_copies(source.GFS, lambda u: asked.append(u) or False)(url)
+    assert asked == [url]
 
 
 def test_ifs_newest_complete_cycle():

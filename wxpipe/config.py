@@ -94,6 +94,10 @@ class Source:
     read_limit_seconds: float | None = None   # a read started after this from the job's start drops it; None: no limit
     cache_one_cycle: bool = False             # a job deletes the other cycles' folders of its download cache
     probes: tuple[Probe, ...] = ()
+    # The counts of the job's reads per copy: zeroed at the job's start, and the run summary's line of
+    # them; None: the source writes no such line.
+    reads_reset: Callable[[], None] | None = None
+    reads_report: Callable[[str, str], str] | None = None
 
     @property
     def name(self) -> str:
@@ -182,8 +186,12 @@ IFS = Source(
     read=ecmwf.read,
     attribution="ECMWF IFS open data.",
     attribution_parts=IFS_ATTRIBUTION_PARTS,
-    # The mirror answers "503 SlowDown" often: two reads at a time, and a job still reading after
-    # 45 minutes is dropped, its downloads kept for the next hour's try in the Actions cache.
+    # Read from three copies in order, the data portal first (wxpipe.source.IFS). The AWS bucket behind
+    # the other two answered "503 SlowDown" to all ten attempts of one read from GitHub's runner, and to
+    # 126 of the sample fetch's 270 requests; the portal refused none in the probe of 2026-11-24, and is
+    # limited to between 500 and 2000 simultaneous connections for all its users. So two reads at a
+    # time, and a job still reading after 45 minutes is dropped, its downloads kept for the next hour's
+    # try in the Actions cache.
     workers=2,
     read_limit_seconds=45 * 60,
     cache_one_cycle=True,
@@ -191,6 +199,8 @@ IFS = Source(
     # S12's 2t of 2026112200 at step 0, 9 bits, in K; msl of 2026112312 at step 0, 12 bits, in Pa.
     probes=(Probe("ifs-2t-ccsds.grib2", minimum=221.997971, maximum=315.997971, mean=278.805962),
             Probe("ifs-msl-ccsds.grib2", minimum=95764.125000, maximum=104952.125000, mean=100852.455598)),
+    reads_reset=ecmwf.reads_reset,
+    reads_report=ecmwf.reads_report,
 )
 
 # Every source, in the order of wxpipe.source.INFOS (checked by a test). GFS comes first, so its job is

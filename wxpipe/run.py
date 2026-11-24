@@ -21,7 +21,8 @@ and a `**Skipped:**` summary line, and leaves the site as it was; the other jobs
 workflow's form, a run that builds GFS defers every other source to the next run, with a `::notice::`
 and a `**Deferred:**` line, and a job whose release is earlier than the restored site's is skipped. A
 run fails only when no job was built. It writes `published=true|false` to $GITHUB_OUTPUT and each built
-source's lines to $GITHUB_STEP_SUMMARY when those variables are set.
+source's lines to $GITHUB_STEP_SUMMARY when those variables are set; a source that counts its reads per
+copy, IFS, adds a `**Reads:**` line for each job that reached its probe, built or skipped.
 """
 
 from __future__ import annotations
@@ -396,7 +397,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.cycle:
             cycle = parse_cycle(args.cycle)
         else:
-            cycle = source.latest_complete_cycle(src.info, datetime.now(timezone.utc), gfs.exists, hours[-1])
+            on_copies = source.exists_on_copies(src.info, gfs.exists)
+            try:
+                cycle = source.latest_complete_cycle(src.info, datetime.now(timezone.utc), on_copies, hours[-1])
+            finally:
+                line = source.discovery_line(src.info, on_copies)
+                if line is not None:
+                    print(line)
             if cycle is None:
                 print(f"No complete {src.info.name.upper()} run found.")
                 set_output(published=published([]))
@@ -419,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     done: list[Job] = []
     lines: list[str] = []
     skipped: list[str] = []
+    built_reads: list[str] = []   # the built jobs' **Reads:** lines, for a run refused after its builds
     for job in jobs:
         name = job.source.info.name
         if workflow and "gfs" in built:
@@ -438,10 +446,16 @@ def main(argv: list[str] | None = None) -> int:
         done.append(job)
         lines += summary_lines(name, job.release, len(job.hours), len(job.fields),
                                job.report["seconds"], job.fetcher.downloaded)
+        reads = _reads_line(job)
+        if reads is not None:
+            lines.append(f"- {reads}")   # a bullet of its own: a bare line would render inside the one above
+            built_reads.append(reads)
 
     if not built:
         _fail(RunRefused("run refused, every source skipped: " + "; ".join(skipped)))
     if lost and "gfs" not in built:
+        for reads in built_reads:   # the Build list is never written, so the built jobs' lines go here
+            summary.append(["", reads])
         _fail(RunRefused("run refused: the site has no readable manifest.json and GFS was not built, so "
                          "no manifest is written and nothing is published; the live site stays as it was"))
     _finish(done, out, args, built, lines)
@@ -460,8 +474,10 @@ def _refuse_an_earlier_release(job: Job, on_site: dict | None) -> None:
 def _prepare(job: Job, args) -> None:
     """A job's steps before its build: the cache's other cycles cleared, the probe, the index reads under
     the source's time limit, which then runs on through the build's message reads, and the gaps. Any
-    failure raises."""
+    failure raises. The source's read counts are zeroed first."""
     src = job.source
+    if src.reads_reset is not None:
+        src.reads_reset()
     if src.cache_one_cycle:
         clear_other_cycles(src, args.work, job.cycle)
     job.started = clock()
@@ -485,7 +501,24 @@ def _skip(job: Job, error: Exception, args) -> str:
     text = f"{job.label}: {reason}"
     print(f"::error::Skipped {text}")
     summary.append([f"**Skipped:** {text}"])
+    reads = _reads_line(job)
+    if reads is not None:
+        summary.append(["", reads])   # a paragraph of its own after the **Skipped:** line
     return text
+
+
+def _reads_line(job: Job) -> str | None:
+    """The source's `**Reads:**` line of a job that reached `_prepare`, printed at once; None for a
+    source without one or a job dropped before it. It never raises: a failure gives a line saying so."""
+    report = job.source.reads_report
+    if report is None or job.started is None:
+        return None
+    try:
+        line = report(job.source.info.name, job.release)
+    except Exception as e:
+        line = f"**Reads:** {job.label}: not available: {type(e).__name__}: {e}"
+    print(line)
+    return line
 
 
 def _fail(error: Exception) -> None:
