@@ -1,6 +1,8 @@
 """GFS 0.25 degree files on the NOAA Open Data bucket on AWS: .idx parsing, record pickers, HTTP reads.
 
-The URLs and the run discovery come from GFS's description in `wxpipe.source`. Standard library only,
+GFS-Wave's files, in the same bucket with the same .idx form, are read by the same functions, each of
+its messages checked whole (`read_checked`). The URLs and the run discovery come from each source's
+description in `wxpipe.source`. Standard library only,
 since `check.py` imports this module before any install.
 """
 
@@ -114,6 +116,35 @@ def read(url: str, byte_range: tuple[int, int | None] | None = None) -> bytes:
     """The byte-range reader of GFS's description. It looks `http_get` up when called, so a test that
     replaces `gfs.http_get` replaces every read the pipeline makes."""
     return http_get(url, byte_range)
+
+
+def check_message(url: str, byte_range: tuple[int, int | None], data: bytes) -> None:
+    """Raises OSError unless [data], read for [byte_range], is one whole GRIB2 message: exactly the asked
+    length when the range's end is known, the four bytes `GRIB` first, the edition byte at offset 7
+    equal to 2, the length field at offsets 8 to 15, big-endian, equal to the body's length, and the
+    four bytes `7777` last. The checks of ECMWF's range reads (`ecmwf._accept`)."""
+    start, end = byte_range
+    if end is not None and len(data) != end - start + 1:
+        raise OSError(f"range read of {url} gave {len(data)} bytes, expected {end - start + 1}")
+    if data[:4] != b"GRIB":
+        raise OSError(f"range read of {url} does not begin with GRIB")
+    if len(data) < 16 or data[7] != 2:
+        raise OSError(f"range read of {url} is not a GRIB edition 2 message")
+    if int.from_bytes(data[8:16], "big") != len(data):
+        raise OSError(f"range read of {url}: the message's length field "
+                      f"{int.from_bytes(data[8:16], 'big')} is not its {len(data)} bytes")
+    if data[-4:] != b"7777":
+        raise OSError(f"range read of {url} does not end with 7777")
+
+
+def read_checked(url: str, byte_range: tuple[int, int | None] | None = None) -> bytes:
+    """The byte-range reader of GFS-Wave's description: `read`, and each range read checked whole by
+    `check_message`, so a short or foreign answer skips the source instead of being decoded. A whole
+    read, an index, is returned as given. It looks `http_get` up when called, as `read` does."""
+    data = http_get(url, byte_range)
+    if byte_range:
+        check_message(url, byte_range, data)
+    return data
 
 
 # The waits between the four attempts of `exists`, in seconds: shorter than ECMWF's reads, since GFS's

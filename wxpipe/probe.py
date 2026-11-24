@@ -1,9 +1,12 @@
 """The probe: does this machine's ecCodes decode a source's committed messages to their known figures?
 
     python -m wxpipe.probe ifs
+    python -m wxpipe.probe gfswave
 
-Exits 0 when every probe message of the source decodes onto the shared grid, every value finite, its
-minimum, maximum and mean each within TOLERANCE of the recorded figures; 1 with the reason otherwise.
+Exits 0 when every probe message of the source decodes onto the shared grid, with every value finite,
+or, for a probe that records a missing count, exactly that many values missing, and its minimum,
+maximum and mean over the present values each within TOLERANCE of the recorded figures; 1 with the
+reason otherwise.
 `wxpipe.run` runs it in a child process before it reads a source's index files, so a library that
 cannot read the source's packing, or that crashes on it, skips that source only.
 """
@@ -27,8 +30,16 @@ def check(source: config.Source) -> None:
         values = grib.decode((SAMPLES / p.file).read_bytes(), source)
         if values.shape != (config.NY, config.NX):
             raise ValueError(f"{p.file}: shape {values.shape}, expected {(config.NY, config.NX)}")
-        if not np.isfinite(values).all():
-            raise ValueError(f"{p.file}: {int(np.count_nonzero(~np.isfinite(values)))} values are not finite")
+        present = np.isfinite(values)
+        absent = int(np.count_nonzero(~present))
+        if p.missing is None:
+            if absent:
+                raise ValueError(f"{p.file}: {absent} values are not finite")
+        elif absent != p.missing:
+            raise ValueError(f"{p.file}: {absent} values missing, expected {p.missing}")
+        values = values[present]
+        if values.size == 0:
+            raise ValueError(f"{p.file}: no value present")
         got = {"minimum": float(values.min()), "maximum": float(values.max()), "mean": float(values.mean())}
         for name, value in got.items():
             expected = getattr(p, name)

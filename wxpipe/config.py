@@ -3,8 +3,8 @@
 A source is described in two parts. Its standard-library part, `wxpipe.source.SourceInfo`, holds what
 the cheap check needs: name, last hour, cycle step and run discovery. Its full part, `Source` here,
 adds the grid as delivered, the forecast hours, the fields with their tables, the fetch functions, the
-attribution, and how the source is read: its workers, its read time limit, its cache and its probe
-messages. The rationale for each choice is in docs/DESIGN.md.
+attribution, and how the source is read: its workers, its read time limit, its cache, its probe
+messages, whether a run that builds GFS defers it, and whether its job runs in a child process. The rationale for each choice is in docs/DESIGN.md.
 """
 
 from __future__ import annotations
@@ -67,12 +67,15 @@ class Grid:
 @dataclass(frozen=True)
 class Probe:
     """A committed message in `wxpipe/samples/` that the runner's ecCodes must decode to these figures
-    before the source is built (`wxpipe.probe`)."""
+    before the source is built (`wxpipe.probe`). With [missing] set, exactly that many values must be
+    missing, land and ice in a wave message, and the figures are over the present values; without it,
+    every value must be present."""
 
     file: str
     minimum: float
     maximum: float
     mean: float
+    missing: int | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,12 @@ class Source:
     read_limit_seconds: float | None = None   # a read started after this from the job's start drops it; None: no limit
     cache_one_cycle: bool = False             # a job deletes the other cycles' folders of its download cache
     probes: tuple[Probe, ...] = ()
+    # In the workflow's form, a run that builds GFS defers this source to the next run.
+    waits_for_gfs: bool = False
+    # In the workflow's form, the job runs in a child process bound by these seconds, so a crash or a hang
+    # of it ends the child only; None: the job runs in the run's own process. The local form, which the
+    # child runs, always builds in its own process.
+    child_seconds: float | None = None
     # The counts of the job's reads per copy: zeroed at the job's start, and the run summary's line of
     # them; None: the source writes no such line.
     reads_reset: Callable[[], None] | None = None
@@ -127,6 +136,10 @@ PRECIPITATION_LUT = Lut([(0, 0.0), (60, 1.2), (140, 8.0), (200, 30.0), (254, 150
 WIND_LUT = Lut([(0, -80.0), (20, -40.0), (234, 40.0), (254, 80.0)])
 PRESSURE_LUT = Lut([(0, 870.0), (20, 950.0), (234, 1050.0), (254, 1090.0)])
 CLOUD_LUT = Lut([(0, 0.0), (254, 100.0)])
+# GFS-Wave's own: 0.05 m a byte to 10 m and about 0.185 m above; 0.1 s a byte to 20 s and about 0.185 s
+# above. The sample run 2026112412's largest values were 11.98 m and 26.64 s.
+WAVE_HEIGHT_LUT = Lut([(0, 0.0), (200, 10.0), (254, 20.0)])
+WAVE_PERIOD_LUT = Lut([(0, 0.0), (200, 20.0), (254, 30.0)])
 
 GFS = Source(
     info=source_info.GFS,
@@ -201,11 +214,42 @@ IFS = Source(
             Probe("ifs-msl-ccsds.grib2", minimum=95764.125000, maximum=104952.125000, mean=100852.455598)),
     reads_reset=ecmwf.reads_reset,
     reads_report=ecmwf.reads_report,
+    # A run that builds GFS does not wait for ECMWF's reads, which its copies' SlowDown answers can
+    # stretch to the read limit and more; the next run, in which GFS is not new, builds it.
+    waits_for_gfs=True,
+)
+
+GFSWAVE = Source(
+    info=source_info.GFSWAVE,
+    # GFS's delivered grid: 0E first, north first, so no roll.
+    grid=Grid(ni=1440, nj=721, lat0=90.0, lon0=0.0, di=0.25, dj=0.25, j_scans_positively=0, i_scans_negatively=0),
+    # GFS's 209 hours: hourly to 120 h, then every 3 h to 384 h.
+    forecast_hours=GFS.forecast_hours,
+    # Land and ice are missing in the messages' bitmap, and so byte 255 in the tiles.
+    fields=(
+        Field("wave_height.sfc", "m", "HTSGW:surface", WAVE_HEIGHT_LUT),    # significant height of combined waves
+        Field("wave_period.sfc", "s", "PERPW:surface", WAVE_PERIOD_LUT),    # primary wave mean period
+    ),
+    parse_idx=gfs.parse_idx,
+    instant_record=gfs.instant_record,
+    accumulation_records=gfs.accumulation_records,
+    # Each message checked whole: GFS-Wave's JPEG 2000 messages are read by a decoder library that
+    # GFS's builds never use.
+    read=gfs.read_checked,
+    attribution="NOAA NCEP GFS-Wave, the global 0.25 degree wave model of the Global Forecast System. Public domain.",
+    # Built in GFS's run, so GFS's publication waits for it: a job still reading after 15 minutes is
+    # dropped and GFS is published without it; and the job runs in a child process of at most 20
+    # minutes, so a crash of the JPEG 2000 decoder or a stalled read ends the child, never GFS's run.
+    read_limit_seconds=15 * 60,
+    child_seconds=20 * 60,
+    # JPEG 2000 at 10 bits, the figures over the present values from the local ecCodes decode, in m:
+    # S12's HTSGW of 2026112206 at f000.
+    probes=(Probe("gfswave-htsgw-jpeg.grib2", minimum=0.0, maximum=8.27, mean=2.267598, missing=468208),),
 )
 
 # Every source, in the order of wxpipe.source.INFOS (checked by a test). GFS comes first, so its job is
-# built before ECMWF's.
-SOURCES: tuple[Source, ...] = (GFS, IFS)
+# built first; then GFS-Wave, from the same bucket, built in the same run; ECMWF's slow reads last.
+SOURCES: tuple[Source, ...] = (GFS, GFSWAVE, IFS)
 
 
 def source(name: str) -> Source:

@@ -162,6 +162,40 @@ def test_a_gfs_only_manifest_has_todays_shape():
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", live["generated_at"])
 
 
+# ---- W6: the size gate's held_back ------------------------------------------------------------
+
+def test_held_back_is_written_after_previous():
+    # A9: the keys in their order; an empty held_back is left out, as an empty previous is.
+    m = site.assemble({"gfs": entry("gfs", "2026110712")}, {"gfs": entry("gfs", "2026110706")}, NOW,
+                      {"gfswave": "2026110712"})
+    assert list(m) == ["version", "generated_at", "sources", "previous", "held_back"]
+    assert m["held_back"] == {"gfswave": "2026110712"}
+    assert list(site.assemble({"gfs": entry("gfs", "2026110712")}, {}, NOW, {"gfswave": "2026110712"})) == [
+        "version", "generated_at", "sources", "held_back"]
+    for empty in (None, {}):
+        assert list(site.assemble({"gfs": entry("gfs", "2026110712")}, {}, NOW, empty)) == [
+            "version", "generated_at", "sources"]
+
+
+def test_the_merge_keeps_held_back_for_a_source_not_built():
+    # A9: kept for gfswave when only GFS is built; left out for gfswave once it is built.
+    old = site.assemble({"gfs": entry("gfs", "2026110706"), "gfswave": entry("gfswave", "2026110700")},
+                        {"gfs": entry("gfs", "2026110700")}, NOW, {"gfswave": "2026110706"})
+    new = site.merge(old, {"gfs": entry("gfs", "2026110712")}, 2, NOW)
+    assert new["held_back"] == {"gfswave": "2026110706"}
+    assert list(new) == ["version", "generated_at", "sources", "previous", "held_back"]
+    rebuilt = site.merge(old, {"gfswave": entry("gfswave", "2026110712")}, 2, NOW)
+    assert "held_back" not in rebuilt
+    assert rebuilt["sources"]["gfswave"] == entry("gfswave", "2026110712")
+    # Several entries: only the built source's goes.
+    old = site.assemble({"gfs": entry("gfs", "2026110706")}, {}, NOW, {"gfswave": "2026110706", "ifs": "2026110700"})
+    assert site.merge(old, {"gfswave": entry("gfswave", "2026110712")}, 2, NOW)["held_back"] == {"ifs": "2026110700"}
+    # An old manifest without held_back, or with one that is not an object, gives none.
+    for bad in (None, [], "gfswave"):
+        old = {"version": 1, "sources": {"gfs": entry("gfs", "2026110706")}, "held_back": bad}
+        assert "held_back" not in site.merge(old, {"gfs": entry("gfs", "2026110712")}, 2, NOW)
+
+
 # ---- pruning ---------------------------------------------------------------------------------
 
 def test_pruning_deletes_only_the_built_sources_old_folders(tmp_path):

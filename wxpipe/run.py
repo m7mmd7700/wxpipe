@@ -9,7 +9,7 @@ and refuses the run when GFS is not among the sources built.
 
 The local form builds one source:
 
-    python -m wxpipe.run --out site [--source gfs|ifs] [--cycle 2026110712] [--hours 0,1,6] [--fields temperature.2m]
+    python -m wxpipe.run --out site [--source gfs|gfswave|ifs] [--cycle 2026110712] [--hours 0,1,6] [--fields temperature.2m]
 
 Without --cycle it takes the newest run whose last forecast hour is published. With
 --published-manifest it stops early when that run is already on the site.
@@ -18,8 +18,11 @@ Each source is a job of its own, built in the order of `config.SOURCES`: its pro
 its gaps, then its release, built under <work>/stage/ and moved into the site once whole. A job that
 fails at any step, a record missing that a frame needs among them, is skipped with an `::error::` line
 and a `**Skipped:**` summary line, and leaves the site as it was; the other jobs go on. In the
-workflow's form, a run that builds GFS defers every other source to the next run, with a `::notice::`
-and a `**Deferred:**` line, and a job whose release is earlier than the restored site's is skipped. A
+workflow's form, a run that builds GFS defers each source whose description waits for GFS, IFS, to the
+next run, with a `::notice::` and a `**Deferred:**` line, while GFS-Wave is built after GFS in the same
+run; and a job whose release is earlier than the restored site's is skipped. In the workflow's form a
+source with child_seconds, GFS-Wave, is built in a child process that runs the local form below, bound
+by those seconds, so a crash or a hang of it skips that source only and GFS is still published. A
 run fails only when no job was built. It writes `published=true|false` to $GITHUB_OUTPUT and each built
 source's lines to $GITHUB_STEP_SUMMARY when those variables are set; a source that counts its reads per
 copy, IFS, adds a `**Reads:**` line for each job that reached its probe, built or skipped.
@@ -429,23 +432,26 @@ def main(argv: list[str] | None = None) -> int:
     built_reads: list[str] = []   # the built jobs' **Reads:** lines, for a run refused after its builds
     for job in jobs:
         name = job.source.info.name
-        if workflow and "gfs" in built:
-            # GFS never waits on another source's reads: the next hourly run, in which GFS is not new,
-            # builds the others alone.
+        if workflow and "gfs" in built and job.source.waits_for_gfs:
+            # GFS never waits on such a source's reads, IFS's: the next hourly run, in which GFS is not
+            # new, builds it. GFS-Wave is built in GFS's run, and GFS's publication waits for it.
             print(f"::notice::Deferred {job.label}: GFS is built in this run; tried in the next run")
             summary.append([f"**Deferred:** {job.label}: GFS is built in this run"])
             continue
         try:
             if workflow:
                 _refuse_an_earlier_release(job, on_site)
-            _prepare(job, args)
-            built[name] = _build(job, out, args)
+            if workflow and job.source.child_seconds is not None:
+                built[name] = _build_in_child(job, out, args)
+            else:
+                _prepare(job, args)
+                built[name] = _build(job, out, args)
         except Exception as e:   # anything, a programming error included, so GFS still publishes
             skipped.append(_skip(job, e, args))
             continue
         done.append(job)
         lines += summary_lines(name, job.release, len(job.hours), len(job.fields),
-                               job.report["seconds"], job.fetcher.downloaded)
+                               job.report["seconds"], job.report["downloaded_bytes"])
         reads = _reads_line(job)
         if reads is not None:
             lines.append(f"- {reads}")   # a bullet of its own: a bare line would render inside the one above
@@ -565,6 +571,87 @@ def _build(job: Job, out: Path, args) -> dict:
     return entry
 
 
+def _text(output) -> str:
+    """A child's captured output as text: TimeoutExpired may carry bytes, or None."""
+    if output is None:
+        return ""
+    return output.decode("utf-8", "replace") if isinstance(output, bytes) else output
+
+
+def _last_line(*outputs: str) -> str:
+    lines = [line.strip() for text in outputs for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else "no output"
+
+
+def _print_child(name: str, stdout: str, stderr: str) -> None:
+    """The child's output in the job's log, each line marked as the child's, so a `::error::` line of
+    the child is not a second annotation of the run."""
+    for line in (stdout + "\n" + stderr).splitlines():
+        if line.strip():
+            print(f"{name} child: {line}")
+
+
+def _build_in_child(job: Job, out: Path, args) -> dict:
+    """Builds a job in a child process, `python -m wxpipe.run` in the local form into a site of its own
+    under <work>/child/<name>/<release>/, bound by the source's child_seconds. A crash or a hang of the
+    child, its decoder library's among them, then ends the child only. On success its release is moved
+    into the site and its manifest entry returned; any other end raises JobDropped. The child's folder is
+    deleted in every case."""
+    src, name, release = job.source, job.source.info.name, job.release
+    child_root = args.work / "child" / name / release
+    child_site = child_root / "site"
+    if child_root.exists():   # left by a killed run
+        shutil.rmtree(child_root)
+    report_path = args.work / f"report-{name}-{release}.json"
+    report_path.unlink(missing_ok=True)   # so the report read below is the child's own
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), env.get("PYTHONPATH", "")) if p)
+    env.pop("GITHUB_OUTPUT", None)
+    env.pop("GITHUB_STEP_SUMMARY", None)
+    command = [sys.executable, "-m", "wxpipe.run", "--out", str(child_site), "--work", str(args.work),
+               "--source", name, "--cycle", release, "--hours", ",".join(str(h) for h in job.hours),
+               "--keep", "1", "--precip-method", args.precip_method, "--workers", str(args.workers)]
+    job.started = clock()
+    try:
+        try:
+            done = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True,
+                                  timeout=src.child_seconds)
+        except subprocess.TimeoutExpired as e:
+            stdout, stderr = _text(e.stdout), _text(e.stderr)
+            _print_child(name, stdout, stderr)
+            raise JobDropped(f"child of {name} timed out after {src.child_seconds:.0f} s: "
+                             f"{_last_line(stdout, stderr)}") from None
+        stdout, stderr = _text(done.stdout), _text(done.stderr)
+        _print_child(name, stdout, stderr)
+        if done.returncode != 0:
+            raise JobDropped(f"child of {name} failed, exit {done.returncode}: {_last_line(stdout, stderr)}")
+        entry = (((site.read_manifest(child_site / "manifest.json") or {}).get("sources")) or {}).get(name)
+        if not isinstance(entry, dict) or entry.get("release") != release:
+            found = entry.get("release") if isinstance(entry, dict) else None
+            raise JobDropped(f"child of {name} exited 0 but its manifest holds "
+                             f"{'no ' + name + ' entry' if found is None else 'release ' + str(found)}, "
+                             f"not {release}")
+        built_dir = child_site / name / release
+        if not built_dir.is_dir():
+            raise JobDropped(f"child of {name} exited 0 but wrote no folder {name}/{release}")
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if not isinstance(report, dict) or not {"seconds", "downloaded_bytes"} <= set(report):
+                raise ValueError("no seconds or downloaded_bytes")
+        except (OSError, ValueError) as e:
+            raise JobDropped(f"child of {name} exited 0 but its build report is unreadable: {e}") from None
+        _move_in(built_dir, out / name / release, args.work / "stage" / name / f"{release}.old")
+        job.report = report
+        return entry
+    finally:
+        shutil.rmtree(child_root, ignore_errors=True)
+        for folder in (child_root.parent, child_root.parent.parent):   # <work>/child/<name>, <work>/child
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+
+
 def _move_in(stage: Path, release_dir: Path, old: Path) -> None:
     """Moves a built release into the site. A folder of the same release is set aside at [old] first and
     deleted only once the new one is in place; if the move fails, any partial folder is removed and the
@@ -600,7 +687,7 @@ def _finish(jobs: list, out: Path, args, built: dict, lines: list[str]) -> None:
     summary.append(["### Build", ""] + lines)
     for job in jobs:
         print(f"{job.source.info.name.upper()} {job.release}: {len(job.hours)} frames, {len(job.fields)} fields, "
-              f"{job.report['seconds']} s, {job.fetcher.downloaded / 1e6:.1f} MB downloaded")
+              f"{job.report['seconds']} s, {job.report['downloaded_bytes'] / 1e6:.1f} MB downloaded")
     values = {"published": published(built)}
     if len(jobs) == 1:
         values["release"] = jobs[0].release

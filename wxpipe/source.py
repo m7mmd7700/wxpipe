@@ -36,6 +36,18 @@ GFS = SourceInfo(
     lookback_cycles=6,
 )
 
+# GFS-Wave 0.25 degree, the global wave model of the GFS, in the same NOAA bucket and at GFS's own
+# hours: 209 steps to 384 h, a run complete once f384's index is there, six cycles back.
+GFSWAVE = SourceInfo(
+    name="gfswave",
+    last_hour=384,
+    cycle_hours=6,
+    base_url="https://noaa-gfs-bdp-pds.s3.amazonaws.com",
+    file_pattern="{base}/gfs.{cycle:%Y%m%d}/{cycle:%H}/wave/gridded/gfswave.t{cycle:%H}z.global.0p25.f{hour:03d}.grib2",
+    idx_suffix=".idx",
+    lookback_cycles=6,
+)
+
 # ECMWF IFS 0.25 degree from three copies of ECMWF's open data, tried in this order: ECMWF's own data
 # portal, which refused none of the probe's requests of 2026-11-24; the AWS bucket's CloudFront door;
 # the AWS bucket by its S3 host, which answered "503 SlowDown" to all ten attempts of one read from
@@ -57,8 +69,9 @@ IFS = SourceInfo(
             "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"),
 )
 
-# The standard-library parts of every source, in the order of wxpipe.config.SOURCES (checked by a test).
-INFOS: tuple[SourceInfo, ...] = (GFS, IFS)
+# The standard-library parts of every source, in the order of wxpipe.config.SOURCES (checked by a test):
+# GFS and GFS-Wave from NOAA's bucket first, then ECMWF IFS.
+INFOS: tuple[SourceInfo, ...] = (GFS, GFSWAVE, IFS)
 
 
 def info(name: str) -> SourceInfo:

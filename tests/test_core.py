@@ -5,15 +5,26 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from wxpipe import config, gfs, precip, tiles, wxt
+from wxpipe import config, ecmwf, gfs, precip, tiles, wxt
 from wxpipe.quantize import MISSING, Lut
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def no_requests(monkeypatch):
+    """Every test here: any request fails the test, unless a test names its own fake."""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"a request was made: {args!r}")
+
+    monkeypatch.setattr(gfs, "http_get", refuse)
+    monkeypatch.setattr(gfs, "exists", refuse)
+    monkeypatch.setattr(ecmwf, "http_get", refuse)
+
+
 # ---- quantisation ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("field", config.GFS.fields, ids=lambda f: f.name)
+@pytest.mark.parametrize("field", config.GFS.fields + config.GFSWAVE.fields, ids=lambda f: f.name)
 def test_every_field_round_trips_within_half_a_step(field):
     rng = np.random.default_rng(7)
     values = rng.uniform(field.lut.min_value, field.lut.max_value, 20_000)
@@ -313,3 +324,91 @@ def test_negative_rates_are_counted_and_clamped():
 def test_missing_accumulations_give_no_rate():
     assert precip.rate(1, 0, {}, {}, "bucket") == (None, 0)
     assert precip.rate(7, 6, {(6, 7): grid(1)}, {}, "since-start") == (None, 0)
+
+
+# ---- GFS-Wave's reads: each message checked whole (W5) ---------------------------------------------
+
+WAVE_URL = "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20261124/12/wave/gridded/gfswave.t12z.global.0p25.f000.grib2"
+
+
+def grib2(n: int) -> bytes:
+    """A made-up GRIB2 message of [n] bytes whose markers, edition and length field pass the check."""
+    return b"GRIB" + b"\0\0\0" + b"\x02" + n.to_bytes(8, "big") + b"\0" * (n - 20) + b"7777"
+
+
+def serving(monkeypatch, body: bytes) -> list:
+    """gfs.http_get replaced by a fake that answers [body] to every read; returns the reads asked."""
+    asked = []
+
+    def fake_get(url, byte_range=None):
+        asked.append((url, byte_range))
+        return body
+
+    monkeypatch.setattr(gfs, "http_get", fake_get)
+    return asked
+
+
+def test_read_checked_returns_a_whole_message(monkeypatch):
+    # A6: the range with its end and the range without one; the read goes through http_get looked up
+    # when called.
+    message = grib2(100)
+    asked = serving(monkeypatch, message)
+    assert gfs.read_checked(WAVE_URL, (1000, 1099)) == message
+    assert gfs.read_checked(WAVE_URL, (1000, None)) == message
+    assert asked == [(WAVE_URL, (1000, 1099)), (WAVE_URL, (1000, None))]
+
+
+def test_read_checked_returns_a_whole_read_as_given(monkeypatch):
+    # A6: an index, or any read with no range, is not checked.
+    for body in (b"1:0:d=2026112412:WIND:surface:anl:\n", b"", b"not a message"):
+        asked = serving(monkeypatch, body)
+        assert gfs.read_checked(WAVE_URL + ".idx") == body
+        assert asked == [(WAVE_URL + ".idx", None)]
+
+
+def broken(kind: str) -> bytes:
+    message = bytearray(grib2(100))
+    if kind == "head":
+        message[:4] = b"GRIX"
+    elif kind == "edition":
+        message[7] = 1
+    elif kind == "length":
+        message[8:16] = (99).to_bytes(8, "big")
+    elif kind == "tail":
+        message[-4:] = b"7776"
+    return bytes(message)
+
+
+@pytest.mark.parametrize("kind, reason", [
+    ("head", "does not begin with GRIB"),
+    ("edition", "is not a GRIB edition 2 message"),
+    ("length", "the message's length field 99 is not its 100 bytes"),
+    ("tail", "does not end with 7777"),
+])
+@pytest.mark.parametrize("byte_range", [(1000, 1099), (1000, None)], ids=["with an end", "without an end"])
+def test_read_checked_refuses_a_foreign_message(monkeypatch, kind, reason, byte_range):
+    # A6: each marker, for a range with an end and for one without.
+    serving(monkeypatch, broken(kind))
+    with pytest.raises(OSError, match=reason):
+        gfs.read_checked(WAVE_URL, byte_range)
+
+
+def test_read_checked_refuses_a_short_body_for_a_range_with_an_end(monkeypatch):
+    # A6: a whole message, but not the length asked.
+    serving(monkeypatch, grib2(100))
+    with pytest.raises(OSError, match="gave 100 bytes, expected 101"):
+        gfs.read_checked(WAVE_URL, (1000, 1100))
+    serving(monkeypatch, grib2(100)[:60])
+    with pytest.raises(OSError, match="gave 60 bytes, expected 100"):
+        gfs.read_checked(WAVE_URL, (1000, 1099))
+    # Without an end, a cut message fails on its markers.
+    with pytest.raises(OSError, match="length field 100 is not its 60 bytes"):
+        gfs.read_checked(WAVE_URL, (1000, None))
+    serving(monkeypatch, b"GRIB")
+    with pytest.raises(OSError, match="is not a GRIB edition 2 message"):
+        gfs.read_checked(WAVE_URL, (1000, None))
+
+
+def test_gfs_keeps_its_unchecked_reader():
+    # W5: GFS's reads do not change.
+    assert config.GFS.read is gfs.read and config.GFSWAVE.read is gfs.read_checked

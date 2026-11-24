@@ -252,11 +252,71 @@ def test_ifs_newest_run_found_on_the_second_copy(offline, monkeypatch, capsys):
     portal_label, cloudfront_label = (r.removeprefix("https://") for r in (portal, cloudfront))
     assert printed.splitlines() == [
         f"gfs: newest complete run {NEWEST}; on the site: 2026110718; build: yes",
+        "gfswave: no complete run found",
         f"ifs discovery: {portal_label} passed over: TimeoutError: timed out",
         f"ifs discovery: {portal_label} passed over: TimeoutError: timed out",
         f"ifs discovery: the newest cycle decided by {cloudfront_label}: false",
         "ifs: newest complete run 2026110712; on the site: 2026110700; build: yes"]
-    assert [u for u in asked if u.startswith(source.GFS.base_url)] == [gfs_complete]
+    # GFS's bucket is asked for GFS's newest run, then for GFS-Wave's six cycles, none complete here.
+    wave = [source.idx_url(source.GFSWAVE, datetime(2026, 11, d, h, tzinfo=timezone.utc), 384)
+            for d, h in ((8, 0), (7, 18), (7, 12), (7, 6), (7, 0), (6, 18))]
+    assert [u for u in asked if u.startswith(source.GFS.base_url)] == [gfs_complete] + wave
+
+
+# ---- W6: a release the size gate held back is not rebuilt every hour ----------------------------------
+
+def held_live(held=None, live="2026110712"):
+    manifest = {"sources": {"gfs": {"release": "2026110800"}, "gfswave": {"release": live}}}
+    if held is not None:
+        manifest["held_back"] = held
+    return manifest
+
+
+def test_a_held_release_is_not_new():
+    # A9: the gate held back 2026110718 and published 2026110712 as current.
+    live = held_live({"gfswave": "2026110718"})
+    assert check.held_release("gfswave", live) == "2026110718"
+    assert check.held("gfswave", "2026110718", live) and check.held("gfswave", "2026110706", live)
+    assert not check.held("gfswave", "2026110800", live)
+    # The held release itself, and an earlier one, are not new; a later one is.
+    assert check.outputs({"gfs": "2026110800", "gfswave": "2026110718"}, live) == {
+        "new": "false", "build": "", "all": "gfs:2026110800,gfswave:2026110718"}
+    assert check.outputs({"gfs": "2026110800", "gfswave": "2026110800"}, live) == {
+        "new": "true", "build": "gfswave:2026110800", "all": "gfs:2026110800,gfswave:2026110800"}
+    # is_new alone is unchanged: the held release is later than the live one.
+    assert check.is_new("gfswave", "2026110718", live)
+
+
+def test_a_held_back_entry_counts_only_for_its_source_and_a_good_release():
+    assert not check.held("gfs", "2026110800", held_live({"gfswave": "2026110718"}))
+    for bad in (None, {}, [], "2026110718", {"gfswave": 2026110718}, {"gfswave": "20261107"},
+                {"gfswave": "".join(chr(0x0660 + int(d)) for d in "2026110718")}, {"gfswave": None}):
+        live = held_live(bad)
+        assert check.held_release("gfswave", live) is None and not check.held("gfswave", "2026110718", live), bad
+        assert check.outputs({"gfswave": "2026110718"}, live)["build"] == "gfswave:2026110718"
+    assert not check.held("gfswave", "2026110718", None)
+
+
+def test_the_check_names_a_held_release(offline, monkeypatch, capsys):
+    # A9: the printed line of a held source, through check.main.
+    live, output = offline
+    live["body"] = json.dumps(held_live({"gfswave": "2026110800"}, live="2026110718")).encode()
+    gfs_complete = source.idx_url(source.GFS, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), source.GFS.last_hour)
+    wave_complete = source.idx_url(source.GFSWAVE, datetime(2026, 11, 8, 0, tzinfo=timezone.utc), 384)
+    monkeypatch.setattr(gfs, "exists", lambda url: url in (gfs_complete, wave_complete))
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output) == {"new": "false", "build": "", "all": f"gfs:{NEWEST},gfswave:{NEWEST}"}
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == [
+        f"gfs: newest complete run {NEWEST}; on the site: {NEWEST}; build: no",
+        f"gfswave: newest complete run {NEWEST}; on the site: 2026110718; build: no; "
+        f"held back by the size gate: 2026110800"]
+    # A later cycle than the held one is new, and its line says nothing of the gate.
+    live["body"] = json.dumps(held_live({"gfswave": "2026110718"}, live="2026110712")).encode()
+    output.unlink()
+    assert check.main(["--manifest", "https://example.invalid/site/manifest.json"]) == 0
+    assert outputs_of(output)["build"] == f"gfswave:{NEWEST}"
+    assert f"gfswave: newest complete run {NEWEST}; on the site: 2026110712; build: yes" in capsys.readouterr().out.splitlines()
 
 
 class Answer:

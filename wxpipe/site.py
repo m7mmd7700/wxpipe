@@ -2,8 +2,9 @@
 
 Standard library only; pure functions on dicts and folders, used by `wxpipe.run` and `wxpipe.gate`.
 The manifest keeps one shape for any number of sources: `version`, `generated_at`, `sources` (each
-source's current release) and `previous` (each source's previous release, present only when it holds
-an entry).
+source's current release), `previous` (each source's previous release, present only when it holds
+an entry) and `held_back` (each source whose current release the size gate dropped, with that release,
+present only when it holds an entry; `wxpipe.check` does not offer that release again).
 """
 
 from __future__ import annotations
@@ -30,11 +31,13 @@ def _entries(manifest: dict | None, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def assemble(sources: dict, previous: dict, now: datetime) -> dict:
-    """A manifest in the one shape, `previous` left out when it is empty."""
+def assemble(sources: dict, previous: dict, now: datetime, held_back: dict | None = None) -> dict:
+    """A manifest in the one shape, `previous` and `held_back` each left out when it is empty."""
     manifest = {"version": 1, "generated_at": now.strftime(TIME_FORMAT), "sources": sources}
     if previous:
         manifest["previous"] = previous
+    if held_back:
+        manifest["held_back"] = held_back
     return manifest
 
 
@@ -44,12 +47,16 @@ def merge(old_manifest: dict | None, built: dict, keep: int, now: datetime) -> d
     Each built source's entry replaces its old one. Its previous entry is none when [keep] is under 2
     or the old manifest lacks the source; the old current one when the releases differ; and the old
     previous one, if any, when the same release was built again, so a rerun after a failed deploy
-    keeps what phones on the old manifest still read. Every other source is kept as it is.
+    keeps what phones on the old manifest still read. Every other source is kept as it is, its
+    `held_back` entry among it; a built source's `held_back` entry is left out, since its new build
+    replaces what the size gate held back.
     """
     old_sources = _entries(old_manifest, "sources")
     old_previous = _entries(old_manifest, "previous")
     sources = dict(old_sources)
     previous = dict(old_previous)
+    held_back = {name: release for name, release in _entries(old_manifest, "held_back").items()
+                 if name not in built}
     for name, entry in built.items():
         prior = old_sources.get(name)
         kept = None
@@ -60,7 +67,7 @@ def merge(old_manifest: dict | None, built: dict, keep: int, now: datetime) -> d
             previous[name] = kept
         else:
             previous.pop(name, None)
-    return assemble(sources, previous, now)
+    return assemble(sources, previous, now, held_back)
 
 
 def releases(manifest: dict | None, name: str) -> set[str]:

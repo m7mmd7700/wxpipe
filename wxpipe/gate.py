@@ -11,7 +11,9 @@ in order on the projected total, before any file is deleted:
     3. or, in place of 2: drop gfswave's current release and publish its previous one as current.
 
 The first candidate at or under the limit is applied: its folders are deleted and the manifest is
-rewritten. If none fits, nothing is deleted and the exit code is 1, so the workflow uploads nothing
+rewritten; after candidate 3 the manifest's `held_back` names gfswave's dropped release, so the hourly
+check does not build it again and see it dropped again, and offers gfswave again at its next new
+cycle. If none fits, nothing is deleted and the exit code is 1, so the workflow uploads nothing
 and the live site stays as it was. GFS is never dropped. In every case it writes <site>/status.json
 and appends the same facts to $GITHUB_STEP_SUMMARY. Standard library only.
 """
@@ -90,9 +92,13 @@ def plan(manifest: dict | None, total: int, sizes: dict[str, int], limit: int) -
 
 
 def apply(site: Path, manifest: dict, drops: list[dict], now: datetime) -> dict:
-    """Deletes the dropped releases' folders and returns the rewritten manifest."""
+    """Deletes the dropped releases' folders and returns the rewritten manifest. A dropped current
+    release is recorded under `held_back`, so `wxpipe.check` does not rebuild it every hour; the old
+    manifest's `held_back` entries are carried, a source dropped again taking its newly dropped release."""
     sources = dict(manifest.get("sources") or {})
     previous = dict(manifest.get("previous") or {})
+    held = manifest.get("held_back")
+    held_back = dict(held) if isinstance(held, dict) else {}
     for drop in drops:
         name = drop["source"]
         folder = site / _path(manifest, drop)
@@ -103,7 +109,8 @@ def apply(site: Path, manifest: dict, drops: list[dict], now: datetime) -> dict:
         else:
             # The current release goes; the previous one is published as current in its place.
             sources[name] = previous.pop(name)
-    return sitelib.assemble(sources, previous, now)
+            held_back[name] = drop["release"]
+    return sitelib.assemble(sources, previous, now, held_back)
 
 
 def status(now: datetime, limit: int, before: int, after: int, dropped: list[dict], manifest: dict | None) -> dict:

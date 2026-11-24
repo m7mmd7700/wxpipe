@@ -10,8 +10,11 @@ per source and writes to $GITHUB_OUTPUT, when that variable is set:
     all=<name>:<cycle>,...      every source with a complete run, for a site that lost its manifest
 
 A source is new when its newest complete run is later than the live one, so a discovery that falls
-back to an older cycle never replaces a newer release. An unreadable live manifest, a source absent
-from it, or a live release that is not a YYYYMMDDHH string counts the source as new. A source with
+back to an older cycle never replaces a newer release, and when the live manifest's `held_back` names
+no release of it as late or later, which the size gate wrote when it dropped that release, so a run
+the gate held back is not rebuilt every hour and the source is offered again at its next new cycle.
+An unreadable live manifest, a source absent from it, or a live release that is not a YYYYMMDDHH
+string counts the source as new. GFS and GFS-Wave are both asked of NOAA's bucket. A source with
 several copies asks them in order, and the first copy that answers true or false decides; each copy
 passed over is printed, and so is the copy that decided the newest cycle. One source's discovery
 error, raised only when every copy raised, is printed with its name and counts as no complete run
@@ -51,10 +54,27 @@ def is_new(name: str, release: str, live_manifest: dict | None) -> bool:
     return release > live
 
 
+def held_release(name: str, live_manifest: dict | None) -> str | None:
+    """The release of [name] that the size gate held back, by the live manifest's `held_back`; None
+    when there is none or it is not a YYYYMMDDHH string."""
+    held = (live_manifest or {}).get("held_back")
+    release = held.get(name) if isinstance(held, dict) else None
+    return release if isinstance(release, str) and _RELEASE.fullmatch(release) else None
+
+
+def held(name: str, release: str, live_manifest: dict | None) -> bool:
+    """True when the size gate held back a release of [name] not earlier than [release]: building it
+    again would only see the gate drop it again."""
+    back = held_release(name, live_manifest)
+    return back is not None and back >= release
+
+
 def outputs(found: dict[str, str | None], live_manifest: dict | None) -> dict[str, str]:
-    """$GITHUB_OUTPUT's values from each source's newest complete run (None: no complete run)."""
+    """$GITHUB_OUTPUT's values from each source's newest complete run (None: no complete run). A
+    source is new when its run is later than the live one and not held back by the size gate."""
     complete = {name: release for name, release in found.items() if release is not None}
-    new = {name: release for name, release in complete.items() if is_new(name, release, live_manifest)}
+    new = {name: release for name, release in complete.items()
+           if is_new(name, release, live_manifest) and not held(name, release, live_manifest)}
     return {
         "new": "true" if new else "false",
         "build": ",".join(f"{n}:{r}" for n, r in new.items()),
@@ -88,9 +108,13 @@ def main(argv: list[str] | None = None) -> int:
         if release is None:
             print(f"{info.name}: no complete run found")
         else:
-            new = is_new(info.name, release, live)
-            print(f"{info.name}: newest complete run {release}; on the site: "
-                  f"{published(info.name, live) or 'nothing'}; build: {'yes' if new else 'no'}")
+            back = held(info.name, release, live)
+            new = is_new(info.name, release, live) and not back
+            line = (f"{info.name}: newest complete run {release}; on the site: "
+                    f"{published(info.name, live) or 'nothing'}; build: {'yes' if new else 'no'}")
+            if back:
+                line += f"; held back by the size gate: {held_release(info.name, live)}"
+            print(line)
     _output(**outputs(found, live))
     return 0
 

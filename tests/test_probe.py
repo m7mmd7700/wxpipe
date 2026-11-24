@@ -1,5 +1,5 @@
-"""The probe of D11: the committed message's real decode, skipped on the runner, and the child process
-that run.py starts, with a fake subprocess.run."""
+"""The probes of D11 and W4: the committed messages' real decode, skipped on the runner, the rules by a
+fake decode, and the child process that run.py starts, with a fake subprocess.run."""
 
 import dataclasses
 import os
@@ -14,8 +14,8 @@ from wxpipe import config, ecmwf, gfs, grib, probe, run
 
 ROOT = Path(__file__).resolve().parents[1]
 ON_RUNNER = os.environ.get("GITHUB_ACTIONS") == "true"
-# R9: the runner decodes no IFS message in a test; its own probe step is the check there.
-real_decode = pytest.mark.skipif(ON_RUNNER, reason="no real IFS decode in a test on the runner (R9)")
+# R9: the runner decodes no IFS or GFS-Wave message in a test; the probe before each job is the check there.
+real_decode = pytest.mark.skipif(ON_RUNNER, reason="no real IFS or GFS-Wave decode in a test on the runner (R9)")
 
 
 @pytest.fixture(autouse=True)
@@ -29,9 +29,11 @@ def no_requests(monkeypatch):
 
 
 def test_the_probe_messages_are_found_from_the_package():
-    # R10.
+    # R10, for every source's probes.
     assert probe.SAMPLES == Path(probe.__file__).parent / "samples"
-    for p in config.IFS.probes:
+    probes = [p for s in config.SOURCES for p in s.probes]
+    assert [p.file for p in probes] == ["gfswave-htsgw-jpeg.grib2", "ifs-2t-ccsds.grib2", "ifs-msl-ccsds.grib2"]
+    for p in probes:
         assert (probe.SAMPLES / p.file).is_file()
 
 
@@ -159,3 +161,83 @@ def test_run_probe_reports_an_exit_a_crash_and_a_timeout(monkeypatch):
     monkeypatch.setattr(subprocess, "run", answer(subprocess.TimeoutExpired(["python"], 300)))
     with pytest.raises(run.JobDropped, match="timed out after 300 s"):
         run.probe(config.IFS)
+
+
+# ---- GFS-Wave: the JPEG 2000 probe (W4) ---------------------------------------------------------------
+
+WAVE_PROBE = config.GFSWAVE.probes[0]
+
+
+def test_the_wave_probe_message():
+    # A5: S12's HTSGW of 2026112206 at f000, JPEG 2000 at 10 bits, with the local decode's figures.
+    assert config.GFSWAVE.probes == (config.Probe("gfswave-htsgw-jpeg.grib2", 0.0, 8.27, 2.267598, missing=468208),)
+    assert (probe.SAMPLES / WAVE_PROBE.file).stat().st_size == 424696
+
+
+@real_decode
+def test_the_wave_probe_passes_on_the_committed_message():
+    # A5: the real JPEG 2000 decode, skipped on the runner (R9).
+    probe.check(config.GFSWAVE)
+
+
+@real_decode
+def test_a_wave_probe_with_altered_figures_fails():
+    # A5: each rule named in the failure.
+    for altered, reason in ((dataclasses.replace(WAVE_PROBE, missing=468207), "468208 values missing, expected 468207"),
+                            (dataclasses.replace(WAVE_PROBE, missing=None), "468208 values are not finite"),
+                            (dataclasses.replace(WAVE_PROBE, mean=2.29), "mean 2.267598, expected 2.290000 within 0.01"),
+                            (dataclasses.replace(WAVE_PROBE, minimum=0.02), "minimum 0.000000, expected 0.020000"),
+                            (dataclasses.replace(WAVE_PROBE, maximum=8.25), "maximum 8.270000, expected 8.250000")):
+        with pytest.raises(ValueError, match=f"gfswave-htsgw-jpeg.grib2: {reason}"):
+            probe.check(dataclasses.replace(config.GFSWAVE, probes=(altered,)))
+
+
+@real_decode
+def test_the_wave_probe_in_a_child_process():
+    run.probe(config.GFSWAVE)
+
+
+def wave_values(missing=468208, low=0.0, high=8.27, mean=2.267598):
+    """A shared grid with [missing] cells of NaN, the rest of mean [mean] with the given extremes."""
+    n = config.NY * config.NX - missing
+    values = np.full(config.NY * config.NX, (mean * n - low - high) / (n - 2))
+    values[:missing] = np.nan
+    values[missing], values[missing + 1] = low, high
+    return values.reshape(config.NY, config.NX)
+
+
+def test_the_wave_probe_counts_the_missing_values_and_takes_the_figures_over_the_rest(monkeypatch):
+    # A5 without ecCodes, so it runs on the runner too: a fake decode.
+    monkeypatch.setattr(grib, "decode", lambda message, src: wave_values())
+    probe.check(config.GFSWAVE)
+    for values, reason in ((wave_values(missing=468209), "468209 values missing, expected 468208"),
+                           (wave_values(missing=0), "0 values missing, expected 468208"),
+                           (wave_values(high=8.3), "maximum 8.300000"),
+                           (wave_values(mean=2.3), "mean 2.300000")):
+        monkeypatch.setattr(grib, "decode", lambda message, src, v=values: v)
+        with pytest.raises(ValueError, match=f"gfswave-htsgw-jpeg.grib2: {reason}"):
+            probe.check(config.GFSWAVE)
+    # Every value missing leaves no figure to take.
+    monkeypatch.setattr(grib, "decode", lambda message, src: np.full((config.NY, config.NX), np.nan))
+    with pytest.raises(ValueError, match="values missing|no value present"):
+        probe.check(config.GFSWAVE)
+    # The shape is checked first, as for IFS.
+    monkeypatch.setattr(grib, "decode", lambda message, src: wave_values()[:-1])
+    with pytest.raises(ValueError, match="shape"):
+        probe.check(config.GFSWAVE)
+
+
+def test_ifs_probes_still_require_every_value_finite(monkeypatch):
+    # A5: a probe without a missing count keeps today's rule, whatever the count.
+    monkeypatch.setattr(grib, "decode", decode_as_recorded(lambda p, values: wave_values() if "2t" in p.file else values))
+    with pytest.raises(ValueError, match="ifs-2t-ccsds.grib2: 468208 values are not finite"):
+        probe.check(config.IFS)
+
+
+def test_the_wave_probes_exit_code(monkeypatch, capsys):
+    monkeypatch.setattr(grib, "decode", lambda message, src: wave_values())
+    assert probe.main(["gfswave"]) == 0
+    assert "probe of gfswave: 1 message(s) decoded as recorded" in capsys.readouterr().out
+    monkeypatch.setattr(grib, "decode", lambda message, src: wave_values(missing=5))
+    assert probe.main(["gfswave"]) == 1
+    assert "probe of gfswave failed: ValueError: gfswave-htsgw-jpeg.grib2: 5 values missing" in capsys.readouterr().err

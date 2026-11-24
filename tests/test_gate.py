@@ -106,6 +106,41 @@ def test_candidate_3_publishes_gfswave_older_release_instead(env):
     assert status["sources"] == {"gfs": "2026110712", "ifs": "2026110700", "gfswave": "2026110706"}
 
 
+def test_candidate_3_records_the_dropped_release_under_held_back(env):
+    # A9 (W6): the manifest it writes names gfswave's dropped release, after previous.
+    root = make_site(env / "site")
+    code, _, manifest = run_gate(root, gate.site_bytes(root) - 85)
+    assert code == 0
+    assert manifest["held_back"] == {"gfswave": "2026110712"}
+    assert list(manifest) == ["version", "generated_at", "sources", "previous", "held_back"]
+
+
+def test_candidate_3_keeps_an_earlier_held_back(env):
+    # A9: an entry of another source is carried; the source's own takes the newly dropped release.
+    root = make_site(env / "site")
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["held_back"] = {"gfswave": "2026110700", "other": "2026110600"}
+    (root / "manifest.json").write_bytes(json.dumps(manifest, indent=1).encode("utf-8"))
+    code, _, manifest = run_gate(root, gate.site_bytes(root) - 85)
+    assert code == 0
+    assert manifest["held_back"] == {"gfswave": "2026110712", "other": "2026110600"}
+
+
+def test_a_drop_of_previous_releases_alone_writes_no_held_back(env):
+    # A9: candidates 1 and 2.
+    for saving in (50, 80):
+        root = make_site(env / f"site-{saving}")
+        code, _, manifest = run_gate(root, gate.site_bytes(root) - saving)
+        assert code == 0 and "held_back" not in manifest
+    # ...and carry an earlier one unchanged.
+    root = make_site(env / "site-carried")
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["held_back"] = {"gfswave": "2026110700"}
+    (root / "manifest.json").write_bytes(json.dumps(manifest, indent=1).encode("utf-8"))
+    code, _, manifest = run_gate(root, gate.site_bytes(root) - 50)
+    assert code == 0 and manifest["held_back"] == {"gfswave": "2026110700"}
+
+
 def test_none_fits_deletes_nothing_and_fails(env):
     root = make_site(env / "site")
     before = gate.site_bytes(root)

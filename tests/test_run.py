@@ -1,9 +1,12 @@
-"""run.py offline: gaps, each source failing on its own, the stage folder, the cache paths, the summary
-and the outputs."""
+"""run.py offline: gaps, each source failing on its own, IFS deferred by a run that builds GFS while
+GFS-Wave is built in it, the stage folder, the cache paths, the summary and the outputs."""
 
 import dataclasses
 import email.message
 import json
+import os
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -17,6 +20,7 @@ from wxpipe import config, ecmwf, gfs, grib, run, site, source
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REAL_HTTP_GET = ecmwf.http_get   # taken before the autouse fixture replaces it
+REAL_SUBPROCESS_RUN = subprocess.run   # likewise, for the one test of a real child process
 HOURS = (0, 6, 7, 120, 384)
 CYCLE = "2026110712"
 IFS_CYCLE = "2026112312"
@@ -49,6 +53,7 @@ def no_requests(monkeypatch, tmp_path):
     monkeypatch.setattr(gfs, "exists", refuse)
     monkeypatch.setattr(ecmwf, "http_get", refuse)
     monkeypatch.setattr(run, "probe", refuse)   # a test with an ifs job names its own probe
+    monkeypatch.setattr(run.subprocess, "run", refuse)   # a test of a child job names its own (F1)
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output.txt"))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
     ecmwf.reads_reset()   # each test starts on IFS's first copy with no counts
@@ -204,7 +209,8 @@ def test_the_workflow_form_builds_every_source_when_the_manifest_is_lost(no_requ
 def two_sources(monkeypatch, work: Path, alt_drop: str | None = None):
     """GFS and a synthetic source "alt" with GFS's own description, three hours and one field each;
     the fixtures' index files in both caches, [alt_drop] removed from alt's hour 6. "alt" comes first in
-    the sources' order, so it runs before GFS and a run that builds GFS does not defer it."""
+    the sources' order, so it runs before GFS; like GFS's own description it does not wait for GFS, so
+    a run that builds GFS would not defer it either."""
     from wxpipe import source
 
     fake_build(monkeypatch, work)
@@ -421,8 +427,9 @@ def gfs_and_ifs(monkeypatch, work: Path, ifs_drop=(), ifs_first=False, seed_ifs=
     """GFS's fixtures as in fake_build, and IFS with hours 0, 150 and 360 and two fields, its fixtures in
     its cache without the records of [ifs_drop]. The probe is a fake that records the sources it probed.
 
-    A run that builds GFS defers IFS (F2), so the tests of an IFS failure beside a built GFS put IFS
-    first in the sources' order with [ifs_first]; then IFS runs before GFS, as any source before GFS does."""
+    A run that builds GFS defers IFS, whose description waits for GFS (F2, W1), so the tests of an IFS
+    failure beside a built GFS put IFS first in the sources' order with [ifs_first]; then IFS runs
+    before GFS, and GFS is not yet built when IFS's job starts."""
     fake_build(monkeypatch, work)
     gfs_small = dataclasses.replace(config.GFS, forecast_hours=(0, 6, 7), fields=config.GFS.fields[:1])
     ifs_small = dataclasses.replace(config.IFS, forecast_hours=IFS_HOURS,
@@ -566,7 +573,7 @@ def test_ifs_alone_is_built_and_published(no_requests, monkeypatch, capsys):
     assert (tmp / "output.txt").read_text(encoding="utf-8") == f"published=true\nrelease={IFS_CYCLE}\n"
 
 
-# ---- F2: a run that builds GFS defers the other sources ---------------------------------------------
+# ---- F2: a run that builds GFS defers IFS, the source that waits for GFS ------------------------------
 
 def test_a_run_that_builds_gfs_defers_ifs(no_requests, monkeypatch, capsys):
     tmp = no_requests
@@ -1319,3 +1326,553 @@ def test_the_local_form_discovers_ifs_on_the_second_copy(no_requests, monkeypatc
     printed = capsys.readouterr().out.splitlines()
     assert printed[:2] == [f"ifs discovery: {HOSTS[0]} passed over: TimeoutError: timed out",
                            f"ifs discovery: the newest cycle decided by {HOSTS[1]}: true"]
+
+
+# ---- GFS-Wave: gaps on the fixtures (A4) --------------------------------------------------------------
+
+WAVE_CYCLE = "2026112412"
+WAVE_HOURS = (0, 123, 384)
+WAVE_OLD, WAVE_OLDER = "2026112406", "2026112400"
+
+
+def wave_text(fhour: int, drop=()) -> str:
+    """The GFS-Wave fixture of [fhour], without the lines holding any text of [drop]."""
+    text = (FIXTURES / "gfswave" / f"gfswave-f{fhour:03d}.idx").read_text(encoding="utf-8")
+    return "\n".join(line for line in text.splitlines() if line.strip() and not any(d in line for d in drop)) + "\n"
+
+
+def wave_index(drop=()):
+    return {h: gfs.parse_idx(wave_text(h, drop)) for h in WAVE_HOURS}
+
+
+def test_gfswave_gaps_on_the_fixtures():
+    # A4.
+    for method in ("bucket", "since-start"):
+        assert run.gaps(config.GFSWAVE, wave_index(), WAVE_HOURS, method) == []
+    idx = wave_index()
+    for h in WAVE_HOURS:
+        assert [r.number for r in idx[h]] == list(range(1, 20))
+        assert config.GFSWAVE.instant_record(idx[h], "HTSGW:surface", h).number == 5
+        assert config.GFSWAVE.instant_record(idx[h], "PERPW:surface", h).number == 6
+    assert run.gaps(config.GFSWAVE, wave_index({":HTSGW:surface:123 hour fcst:"}), WAVE_HOURS, "bucket") == [
+        ("wave_height.sfc", 123)]
+    assert run.gaps(config.GFSWAVE, wave_index({":PERPW:surface:anl:"}), WAVE_HOURS, "bucket") == [
+        ("wave_period.sfc", 0)]
+    assert run.gaps(config.GFSWAVE, wave_index({":HTSGW:surface:384 hour fcst:", ":PERPW:surface:384 hour fcst:"}),
+                    WAVE_HOURS, "bucket") == [("wave_height.sfc", 384), ("wave_period.sfc", 384)]
+    # f000's HTSGW message is the sample's 428,678 bytes.
+    r = config.GFSWAVE.instant_record(idx[0], "HTSGW:surface", 0)
+    assert r.end - r.offset + 1 == 428678
+
+
+def test_a_gfswave_entry_holds_its_two_fields_and_attribution():
+    # A10.
+    entry = run.release_entry(config.GFSWAVE, run.parse_cycle(WAVE_CYCLE), WAVE_HOURS, config.GFSWAVE.fields)
+    assert list(entry) == ["release", "run_time", "path", "frames", "levels", "region", "fields", "attribution"]
+    assert entry["path"] == f"gfswave/{WAVE_CYCLE}" and len(entry["frames"]) == 3
+    assert entry["frames"][-1] - entry["run_time"] == 384 * 3600
+    assert entry["fields"] == {
+        "wave_height.sfc": {"units": "m", "values": {"scale": "lin", "breakpoints": [[0, 0.0], [200, 10.0], [254, 20.0]],
+                                                     "missing": 255}},
+        "wave_period.sfc": {"units": "s", "values": {"scale": "lin", "breakpoints": [[0, 0.0], [200, 20.0], [254, 30.0]],
+                                                     "missing": 255}},
+    }
+    assert entry["attribution"] == ("NOAA NCEP GFS-Wave, the global 0.25 degree wave model of the Global Forecast "
+                                    "System. Public domain.")
+    assert "attribution_parts" not in entry
+    # GFS's and IFS's entries keep their keys and order.
+    gfs_entry = run.release_entry(config.GFS, run.parse_cycle(CYCLE), (0,), config.GFS.fields)
+    ifs_entry = run.release_entry(config.IFS, run.parse_cycle(IFS_CYCLE), (0,), config.IFS.fields)
+    assert list(gfs_entry) == list(entry)
+    assert list(ifs_entry) == list(entry) + ["attribution_parts"]
+
+
+# ---- GFS-Wave through run.main: built in GFS's run (W1), on its own (D3), its limit (W5) -------------
+
+def three_sources(monkeypatch, work: Path, wave_drop=(), seed_wave=True, in_child=False) -> list[str]:
+    """GFS and IFS as in gfs_and_ifs, and GFS-Wave with hours 0, 123 and 384 and both fields, its
+    fixtures in its cache without the lines of [wave_drop]; in config.SOURCES' own order. The probe is a
+    fake that records the sources it probed (R9).
+
+    GFS-Wave's job runs in a child process in the workflow's form (F1); the tests of the deferral rule
+    and of the in-process path build it in the run's own process, with child_seconds None, unless
+    [in_child]."""
+    probed = gfs_and_ifs(monkeypatch, work)
+    gfs_small, ifs_small = config.SOURCES
+    wave_small = dataclasses.replace(config.GFSWAVE, forecast_hours=WAVE_HOURS,
+                                     child_seconds=config.GFSWAVE.child_seconds if in_child else None)
+    monkeypatch.setattr(config, "SOURCES", (gfs_small, wave_small, ifs_small))
+    if seed_wave:
+        cache = work / "gfswave" / WAVE_CYCLE
+        cache.mkdir(parents=True, exist_ok=True)
+        for h in WAVE_HOURS:
+            (cache / f"f{h:03d}.idx").write_bytes(wave_text(h, wave_drop).encode("utf-8"))
+    return probed
+
+
+def site_with_three_sources(out: Path) -> dict:
+    manifest = site_with_gfs_and_ifs(out)
+    for path in (f"gfswave/{WAVE_OLD}", f"gfswave/{WAVE_OLDER}"):
+        (out / path).mkdir(parents=True)
+        (out / path / "0-0.wxt").write_bytes(b"old " + path.encode())
+    manifest["sources"]["gfswave"] = {"release": WAVE_OLD, "path": f"gfswave/{WAVE_OLD}"}
+    manifest["previous"]["gfswave"] = {"release": WAVE_OLDER, "path": f"gfswave/{WAVE_OLDER}"}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    return manifest
+
+
+ALL_THREE = f"gfs:{CYCLE},gfswave:{WAVE_CYCLE},ifs:{IFS_CYCLE}"
+
+
+def run_three(out: Path, work: Path, cycles: str = ALL_THREE, all_cycles: str = ALL_THREE) -> int:
+    return run.main(["--out", str(out), "--work", str(work), "--cycles", cycles, "--all-cycles", all_cycles])
+
+
+def assert_ifs_deferred(tmp: Path, out: Path, before: dict | None, printed: str):
+    if before is not None:
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["sources"]["ifs"] == before["sources"]["ifs"]
+        assert manifest["previous"]["ifs"] == before["previous"]["ifs"]
+    assert not (out / "ifs" / IFS_CYCLE).exists()
+    assert f"::notice::Deferred ifs {IFS_CYCLE}: GFS is built in this run; tried in the next run" in printed
+    assert f"**Deferred:** ifs {IFS_CYCLE}: GFS is built in this run" in (tmp / "summary.md").read_text(encoding="utf-8")
+
+
+def test_a_run_that_builds_gfs_builds_gfswave_and_defers_ifs(no_requests, monkeypatch, capsys):
+    # A7 (W1): GFS, GFS-Wave and IFS all new.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work)
+    before = site_with_three_sources(out)
+    assert run_three(out, work) == 0
+    assert probed == ["gfswave"]
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert list(manifest["sources"]) == ["gfs", "ifs", "gfswave"]
+    assert manifest["sources"]["gfs"]["release"] == CYCLE
+    assert manifest["sources"]["gfswave"]["release"] == WAVE_CYCLE
+    assert manifest["previous"]["gfswave"] == before["sources"]["gfswave"]
+    assert sorted(manifest["sources"]["gfswave"]["fields"]) == ["wave_height.sfc", "wave_period.sfc"]
+    for field in ("wave_height.sfc", "wave_period.sfc"):
+        assert len(list((out / "gfswave" / WAVE_CYCLE / field).rglob("*.wxt"))) == 108
+    assert not (out / "gfswave" / WAVE_OLDER).exists() and (out / "gfswave" / WAVE_OLD).is_dir()
+    printed = capsys.readouterr().out
+    assert "::error::" not in printed
+    assert_ifs_deferred(tmp, out, before, printed)
+    text = (tmp / "summary.md").read_text(encoding="utf-8")
+    assert f"- gfs {CYCLE}: 3 frames, 1 fields" in text and f"- gfswave {WAVE_CYCLE}: 3 frames, 2 fields" in text
+    assert "**Deferred:** gfswave" not in text and "**Reads:**" not in text
+    # Two sources built: no single release in the output.
+    assert (tmp / "output.txt").read_text(encoding="utf-8") == "published=true\n"
+
+
+def test_without_gfs_gfswave_and_ifs_are_both_built(no_requests, monkeypatch, capsys):
+    # A7: GFS not among the jobs.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work)
+    before = site_with_three_sources(out)
+    assert run_three(out, work, cycles=f"gfswave:{WAVE_CYCLE},ifs:{IFS_CYCLE}") == 0
+    assert probed == ["gfswave", "ifs"]
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"]["gfs"] == before["sources"]["gfs"]
+    assert manifest["sources"]["gfswave"]["release"] == WAVE_CYCLE and manifest["sources"]["ifs"]["release"] == IFS_CYCLE
+    assert "::notice::Deferred" not in capsys.readouterr().out
+
+
+def assert_wave_skipped_gfs_published_ifs_deferred(tmp: Path, out: Path, work: Path, before: dict, printed: str,
+                                                   reason: str):
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"]["gfs"]["release"] == CYCLE and (out / "gfs" / CYCLE).is_dir()
+    assert manifest["sources"]["gfswave"] == before["sources"]["gfswave"]
+    assert manifest["previous"]["gfswave"] == before["previous"]["gfswave"]
+    assert (out / "gfswave" / WAVE_OLD).is_dir() and (out / "gfswave" / WAVE_OLDER).is_dir()
+    assert not (out / "gfswave" / WAVE_CYCLE).exists() and not (work / "stage" / "gfswave" / WAVE_CYCLE).exists()
+    errors = [line for line in printed.splitlines() if line.startswith("::error::")]
+    assert len(errors) == 1 and errors[0].startswith(f"::error::Skipped gfswave {WAVE_CYCLE}: ") and reason in errors[0]
+    text = (tmp / "summary.md").read_text(encoding="utf-8")
+    assert f"**Skipped:** gfswave {WAVE_CYCLE}: " in text and reason in text
+    assert f"- gfs {CYCLE}: 3 frames, 1 fields" in text and f"- gfswave {WAVE_CYCLE}" not in text
+    assert (tmp / "output.txt").read_text(encoding="utf-8") == f"published=true\nrelease={CYCLE}\n"
+    assert_ifs_deferred(tmp, out, before, printed)
+
+
+# ---- GFS-Wave's four failure kinds in the local form, which the child runs (A7 after F1) --------------
+# Each drops the job; a local run of one job then raises RunRefused, which is the child's non-zero exit,
+# and leaves the site as it was.
+
+def run_wave_locally(out: Path, work: Path) -> int:
+    return run.main(["--out", str(out), "--work", str(work), "--source", "gfswave", "--cycle", WAVE_CYCLE,
+                     "--hours", ",".join(str(h) for h in WAVE_HOURS)])
+
+
+def assert_wave_dropped_locally(tmp: Path, out: Path, work: Path, before: dict, error, printed: str, reason: str):
+    assert "every source skipped" in str(error.value) and reason in str(error.value)
+    assert tree(out) == before
+    assert not (out / "gfswave" / WAVE_CYCLE).exists() and not (work / "stage" / "gfswave" / WAVE_CYCLE).exists()
+    assert f"::error::Skipped gfswave {WAVE_CYCLE}: " in printed and reason in printed
+    assert f"**Skipped:** gfswave {WAVE_CYCLE}: " in (tmp / "summary.md").read_text(encoding="utf-8")
+    assert not (tmp / "output.txt").exists()
+
+
+def test_a_gap_in_gfswave_drops_its_local_run(no_requests, monkeypatch, capsys):
+    # A7, a gap.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work, wave_drop={":HTSGW:surface:123 hour fcst:"})
+    site_with_three_sources(out)
+    before = tree(out)
+    with pytest.raises(run.RunRefused) as e:
+        run_wave_locally(out, work)
+    assert_wave_dropped_locally(tmp, out, work, before, e, capsys.readouterr().out,
+                                "records missing: wave_height.sfc at hour 123")
+
+
+def test_a_failed_gfswave_probe_drops_its_local_run(no_requests, monkeypatch, capsys):
+    # A7, the probe: the JPEG 2000 check failing on the runner.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work)
+
+    def probe(src):
+        raise run.JobDropped(f"probe of {src.info.name} failed, exit -11: no output")
+
+    monkeypatch.setattr(run, "probe", probe)
+    site_with_three_sources(out)
+    before = tree(out)
+    with pytest.raises(run.RunRefused) as e:
+        run_wave_locally(out, work)
+    assert_wave_dropped_locally(tmp, out, work, before, e, capsys.readouterr().out, "probe of gfswave failed, exit -11")
+
+
+def test_a_gfswave_read_failing_midway_drops_its_local_run(no_requests, monkeypatch, capsys):
+    # A7 and F8: through the real Fetcher and its worker pool, gfs.http_get a named fake answering whole
+    # messages for the first field's ranges and a body ending 7776 for the second field's, so
+    # gfs.read_checked refuses it.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work)
+    monkeypatch.setattr(run.Fetcher, "messages", REAL_MESSAGES)
+    idx = wave_index()
+    period = {gfs.instant_record(idx[h], "PERPW:surface", h).offset for h in WAVE_HOURS}
+    asked = []
+
+    def wave_bucket(url, byte_range=None):
+        assert byte_range is not None, url   # the index files are cached
+        asked.append(byte_range[0])
+        n = byte_range[1] - byte_range[0] + 1
+        return grib2(n)[:-4] + b"7776" if byte_range[0] in period else grib2(n)
+
+    monkeypatch.setattr(gfs, "http_get", wave_bucket)
+    site_with_three_sources(out)
+    before = tree(out)
+    with pytest.raises(run.RunRefused) as e:
+        run_wave_locally(out, work)
+    assert_wave_dropped_locally(tmp, out, work, before, e, capsys.readouterr().out, "does not end with 7777")
+    # The first field's three messages were read and kept; no refused message was written to the cache.
+    assert sum(1 for b in asked if b not in period) == len(WAVE_HOURS) and any(b in period for b in asked)
+    kept = sorted(p.relative_to(work / "gfswave" / WAVE_CYCLE).as_posix()
+                  for p in (work / "gfswave" / WAVE_CYCLE).rglob("*.grib2"))
+    assert kept == [f"f{h:03d}/5.grib2" for h in WAVE_HOURS]
+
+
+def test_a_gfswave_decode_raising_drops_its_local_run(no_requests, monkeypatch, capsys):
+    # A7, a decode error that is not a ValueError, as ecCodes' own are not.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work)
+
+    def decode(message, src):
+        if src.info.name == "gfswave":
+            raise RuntimeError("JPEG 2000 decoding failed")
+        return np.full((config.NY, config.NX), 280.0)
+
+    monkeypatch.setattr(grib, "decode", decode)
+    site_with_three_sources(out)
+    before = tree(out)
+    with pytest.raises(run.RunRefused) as e:
+        run_wave_locally(out, work)
+    assert_wave_dropped_locally(tmp, out, work, before, e, capsys.readouterr().out,
+                                "RuntimeError: JPEG 2000 decoding failed")
+
+
+def test_a_lost_cache_builds_gfs_and_gfswave_and_defers_ifs(no_requests, monkeypatch, capsys):
+    # A7: no manifest on the site, all three in --all-cycles.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work)
+    out.mkdir()
+    assert run_three(out, work, cycles="") == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert list(manifest["sources"]) == ["gfs", "gfswave"] and "previous" not in manifest
+    assert probed == ["gfswave"]
+    assert_ifs_deferred(tmp, out, None, capsys.readouterr().out)
+
+
+def test_a_lost_cache_with_gfs_skipped_builds_gfswave_and_ifs_and_is_refused(no_requests, monkeypatch, capsys):
+    # A7 (D16): GFS with a gap; GFS-Wave and IFS built, then the run refused, no manifest written.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work)
+    text = fixture_text(7)
+    (work / "gfs" / CYCLE / "f007.idx").write_bytes(
+        ("\n".join(line for line in text.splitlines() if ":TMP:2 m above ground:7 hour fcst:" not in line) + "\n").encode())
+    out.mkdir()
+    with pytest.raises(run.RunRefused, match="no readable manifest.json and GFS was not built"):
+        run_three(out, work, cycles="")
+    assert probed == ["gfswave", "ifs"]
+    assert (work / f"report-gfswave-{WAVE_CYCLE}.json").is_file() and (work / f"report-ifs-{IFS_CYCLE}.json").is_file()
+    assert not (out / "manifest.json").exists() and not (tmp / "output.txt").exists()
+    assert "::notice::Deferred" not in capsys.readouterr().out
+
+
+def test_gfswave_past_its_read_limit_is_dropped_and_gfs_is_published(no_requests, monkeypatch, capsys):
+    # A8 (W5): an injected clock past 15 minutes before GFS-Wave's build.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work)
+    now = {"t": 1000.0}
+    monkeypatch.setattr(run, "clock", lambda: now["t"])
+    monkeypatch.setattr(run, "probe", lambda src: now.update(t=now["t"] + 15 * 60 + 1))
+    before = site_with_three_sources(out)
+    assert run_three(out, work) == 0
+    # The index files it had are kept; nothing else of it was read.
+    assert sorted(p.name for p in (work / "gfswave" / WAVE_CYCLE).iterdir()) == ["f000.idx", "f123.idx", "f384.idx"]
+    assert_wave_skipped_gfs_published_ifs_deferred(tmp, out, work, before, capsys.readouterr().out,
+                                                   "read time limit of 15 min passed")
+
+
+def test_gfswave_within_its_read_limit_is_built(no_requests, monkeypatch):
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work)
+    now = {"t": 1000.0}
+    monkeypatch.setattr(run, "clock", lambda: now["t"])
+    monkeypatch.setattr(run, "probe", lambda src: now.update(t=now["t"] + 15 * 60 - 1))
+    site_with_three_sources(out)
+    assert run_three(out, work) == 0
+    assert (out / "gfswave" / WAVE_CYCLE).is_dir()
+
+
+def test_gfswave_messages_are_read_through_read_checked(no_requests, monkeypatch):
+    # W5 through the real Fetcher: the file's URL and its range, a foreign answer refused; GFS-Wave's
+    # cache paths under work/gfswave/.
+    tmp = no_requests
+    fetcher = run.Fetcher(config.GFSWAVE, run.parse_cycle(WAVE_CYCLE), tmp / "work")
+    assert fetcher.idx_path(123).relative_to(tmp).as_posix() == f"work/gfswave/{WAVE_CYCLE}/f123.idx"
+    asked = []
+    body = {"message": None}
+
+    def fake_get(url, byte_range=None):
+        asked.append((url, byte_range))
+        if byte_range is None:
+            return wave_text(123).encode("utf-8")
+        return body["message"](byte_range[1] - byte_range[0] + 1)
+
+    monkeypatch.setattr(gfs, "http_get", fake_get)
+    record = config.GFSWAVE.instant_record(fetcher.idx(123), "HTSGW:surface", 123)
+    body["message"] = lambda n: b"x" * n
+    with pytest.raises(OSError, match="does not begin with GRIB"):
+        fetcher.messages([(123, record)])
+    assert not fetcher.message_path(123, record.number).exists()
+    body["message"] = grib2
+    data = fetcher.messages([(123, record)])[(123, 5)]
+    assert len(data) == record.end - record.offset + 1 == 3457677 - 3033846
+    stem = "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20261124/12/wave/gridded/gfswave.t12z.global.0p25.f123.grib2"
+    assert asked == [(stem + ".idx", None), (stem, (3033846, 3457676)), (stem, (3033846, 3457676))]
+    assert fetcher.message_path(123, 5).stat().st_size == len(data)
+
+
+def test_the_local_form_builds_gfswave(no_requests, monkeypatch):
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work)
+    assert run.main(["--out", str(out), "--work", str(work), "--source", "gfswave", "--cycle", WAVE_CYCLE,
+                     "--hours", "0,123,384"]) == 0
+    assert probed == ["gfswave"]
+    assert sorted(p.name for p in (out / "gfswave" / WAVE_CYCLE).iterdir()) == ["wave_height.sfc", "wave_period.sfc"]
+
+
+# ---- F1 (W11): GFS-Wave's job in a child process in the workflow's form ------------------------------
+
+ON_RUNNER = os.environ.get("GITHUB_ACTIONS") == "true"
+CHILD_REPORT = {"seconds": 90.0, "downloaded_bytes": 12_300_000}
+
+
+class ChildDone:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def fake_child(monkeypatch, returncode=0, raises=None, manifest="good", folder=True, stdout="", stderr=""):
+    """subprocess.run replaced by a fake child that records its call. With exit 0 it writes what a child
+    writes, under the paths of the command line: its site's manifest ([manifest]: "good", "none" with no
+    gfswave entry, or "other" naming another release), its release folder when [folder], and its report."""
+    calls = []
+
+    def run_child(args, **kwargs):
+        calls.append((list(args), kwargs))
+        if raises is not None:
+            raise raises
+        if returncode == 0:
+            site_dir, work = Path(args[args.index("--out") + 1]), Path(args[args.index("--work") + 1])
+            release = args[args.index("--cycle") + 1]
+            entry = run.release_entry(config.GFSWAVE, run.parse_cycle(release), WAVE_HOURS, config.GFSWAVE.fields)
+            sources = {"good": {"gfswave": entry}, "none": {},
+                       "other": {"gfswave": dict(entry, release=WAVE_OLD, path=f"gfswave/{WAVE_OLD}")}}[manifest]
+            site_dir.mkdir(parents=True, exist_ok=True)
+            (site_dir / "manifest.json").write_text(json.dumps({"version": 1, "sources": sources}), encoding="utf-8")
+            if folder:
+                tile = site_dir / "gfswave" / release / "wave_height.sfc" / "60x60-1" / "1-3.wxt"
+                tile.parent.mkdir(parents=True)
+                tile.write_bytes(b"child tile")
+            (work / f"report-gfswave-{release}.json").write_text(json.dumps(CHILD_REPORT), encoding="utf-8")
+        return ChildDone(returncode, stdout, stderr)
+
+    monkeypatch.setattr(run.subprocess, "run", run_child)
+    return calls
+
+
+def test_gfswave_is_built_in_a_child_process(no_requests, monkeypatch, capsys):
+    # F1: the command line, cwd, environment and timeout; the entry merged and the release moved in.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    probed = three_sources(monkeypatch, work, in_child=True)
+    stale = work / "child" / "gfswave" / WAVE_CYCLE / "site" / "left.wxt"   # a killed run's
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"old")
+    calls = fake_child(monkeypatch, stdout="wave_height.sfc: 1.0 MB in 1 s\n")
+    monkeypatch.setenv("PYTHONPATH", "elsewhere")
+    before = site_with_three_sources(out)
+    assert run_three(out, work) == 0
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    child_site = work / "child" / "gfswave" / WAVE_CYCLE / "site"
+    assert args == [sys.executable, "-m", "wxpipe.run", "--out", str(child_site), "--work", str(work),
+                    "--source", "gfswave", "--cycle", WAVE_CYCLE, "--hours", "0,123,384", "--keep", "1",
+                    "--precip-method", "bucket", "--workers", "8"]
+    assert Path(kwargs["cwd"]) == run.ROOT and kwargs["timeout"] == 1200 == 20 * 60
+    assert kwargs["capture_output"] is True and kwargs["text"] is True
+    env = kwargs["env"]
+    assert "GITHUB_OUTPUT" not in env and "GITHUB_STEP_SUMMARY" not in env
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(run.ROOT), "elsewhere"]
+    assert env.get("PATH") == os.environ.get("PATH")
+    # The parent probes nothing itself: the child does.
+    assert probed == []
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"]["gfswave"] == run.release_entry(config.GFSWAVE, run.parse_cycle(WAVE_CYCLE), WAVE_HOURS,
+                                                               config.GFSWAVE.fields)
+    assert manifest["previous"]["gfswave"] == before["sources"]["gfswave"]
+    assert manifest["sources"]["gfs"]["release"] == CYCLE
+    assert (out / "gfswave" / WAVE_CYCLE / "wave_height.sfc" / "60x60-1" / "1-3.wxt").read_bytes() == b"child tile"
+    assert not (out / "gfswave" / WAVE_OLDER).exists()
+    assert not (work / "child").exists() and not (work / "stage" / "gfswave").exists()
+    printed = capsys.readouterr().out
+    assert "gfswave child: wave_height.sfc: 1.0 MB in 1 s" in printed and "::error::" not in printed
+    text = (tmp / "summary.md").read_text(encoding="utf-8")
+    assert f"- gfswave {WAVE_CYCLE}: 3 frames, 2 fields, 1.5 min, 12.3 MB downloaded" in text
+    assert f"GFSWAVE {WAVE_CYCLE}: 3 frames, 2 fields, 90.0 s, 12.3 MB downloaded" in printed
+    assert_ifs_deferred(tmp, out, before, printed)
+    assert (tmp / "output.txt").read_text(encoding="utf-8") == "published=true\n"
+
+
+RUN_REFUSED = (f"Traceback (most recent call last):\n  ...\nwxpipe.run.RunRefused: run refused, every source "
+               f"skipped: gfswave {WAVE_CYCLE}: records missing: wave_height.sfc at hour 123\n")
+
+
+@pytest.mark.parametrize("child, reason", [
+    (dict(returncode=1, stdout=f"::error::Skipped gfswave {WAVE_CYCLE}: records missing\n", stderr=RUN_REFUSED),
+     "child of gfswave failed, exit 1: wxpipe.run.RunRefused: run refused, every source skipped"),
+    (dict(returncode=-11), "child of gfswave failed, exit -11: no output"),
+    (dict(raises=subprocess.TimeoutExpired(["python"], 1200, output=b"wave_height.sfc: 1.0 MB in 50 s\n")),
+     "child of gfswave timed out after 1200 s: wave_height.sfc: 1.0 MB in 50 s"),
+    (dict(manifest="none"), "child of gfswave exited 0 but its manifest holds no gfswave entry, not 2026112412"),
+    (dict(manifest="other"), "child of gfswave exited 0 but its manifest holds release 2026112406, not 2026112412"),
+    (dict(folder=False), "child of gfswave exited 0 but wrote no folder gfswave/2026112412"),
+], ids=["exit 1", "crash", "timeout", "no entry", "another release", "no folder"])
+def test_a_failed_child_skips_gfswave_and_gfs_is_published(no_requests, monkeypatch, capsys, child, reason):
+    # F1: each way a child can fail; GFS built and published, IFS deferred, nothing of the new release
+    # in the site and nothing under <work>/child.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work, in_child=True)
+    fake_child(monkeypatch, **child)
+    before = site_with_three_sources(out)
+    assert run_three(out, work) == 0
+    printed = capsys.readouterr().out
+    assert_wave_skipped_gfs_published_ifs_deferred(tmp, out, work, before, printed, reason)
+    assert not (work / "child").exists()
+    # The child's own lines are in the log, marked as the child's, so its ::error:: is not a second one.
+    if "stdout" in child:
+        assert f"gfswave child: ::error::Skipped gfswave {WAVE_CYCLE}: records missing" in printed
+
+
+def test_a_lost_cache_builds_gfswave_in_its_child(no_requests, monkeypatch, capsys):
+    # F1 on a lost cache: GFS in the run's process, GFS-Wave in its child, IFS deferred.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work, in_child=True)
+    calls = fake_child(monkeypatch)
+    out.mkdir()
+    assert run_three(out, work, cycles="") == 0
+    assert len(calls) == 1
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert list(manifest["sources"]) == ["gfs", "gfswave"] and "previous" not in manifest
+    assert (out / "gfswave" / WAVE_CYCLE).is_dir() and not (work / "child").exists()
+    assert_ifs_deferred(tmp, out, None, capsys.readouterr().out)
+
+
+def test_the_local_form_never_starts_a_child(no_requests, monkeypatch):
+    # F1: --source builds in its own process, since it is what the child runs.
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    three_sources(monkeypatch, work, in_child=True)
+    assert config.source("gfswave").child_seconds == 1200
+    assert run_wave_locally(out, work) == 0   # the autouse fixture refuses any subprocess.run
+    assert (out / "gfswave" / WAVE_CYCLE).is_dir()
+
+
+@pytest.mark.skipif(ON_RUNNER, reason="no real GFS-Wave decode in a test on the runner (R9)")
+def test_a_real_child_builds_gfswave_from_its_cache(no_requests, monkeypatch, capsys):
+    # F1 with a real child process: a cache of two hours under tmp_path, each message the committed probe
+    # message behind a synthetic index line whose record length is the file's size, so run.Fetcher reuses
+    # every file. The job's hours come from the source's forecast hours, the workflow form's rule, so the
+    # source is replaced by one of two hours here; the child takes them from --hours. Any request the
+    # child might still make goes to an unreachable proxy.
+    from wxpipe import probe
+
+    tmp = no_requests
+    work, out = tmp / "work", tmp / "site"
+    hours = (0, 1)
+    message = (probe.SAMPLES / "gfswave-htsgw-jpeg.grib2").read_bytes()
+    n = len(message)
+    cache = work / "gfswave" / WAVE_CYCLE
+    for h in hours:
+        form = "anl" if h == 0 else f"{h} hour fcst"
+        lines = [f"5:0:d={WAVE_CYCLE}:HTSGW:surface:{form}:", f"6:{n}:d={WAVE_CYCLE}:PERPW:surface:{form}:",
+                 f"7:{2 * n}:d={WAVE_CYCLE}:DIRPW:surface:{form}:"]
+        (cache / f"f{h:03d}").mkdir(parents=True)
+        (cache / f"f{h:03d}.idx").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for number in (5, 6):
+            (cache / f"f{h:03d}" / f"{number}.grib2").write_bytes(message)
+    wave = dataclasses.replace(config.GFSWAVE, forecast_hours=hours)
+    monkeypatch.setattr(config, "SOURCES", (config.GFS, wave, config.IFS))
+    monkeypatch.setattr(run.subprocess, "run", REAL_SUBPROCESS_RUN)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    (out / "gfs" / CYCLE).mkdir(parents=True)
+    (out / "manifest.json").write_text(json.dumps({"version": 1, "generated_at": "x", "sources": {
+        "gfs": {"release": CYCLE, "path": f"gfs/{CYCLE}"}}}), encoding="utf-8")
+    cycles = f"gfswave:{WAVE_CYCLE}"
+    assert run.main(["--out", str(out), "--work", str(work), "--cycles", cycles, "--all-cycles", cycles]) == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    entry = manifest["sources"]["gfswave"]
+    assert entry["release"] == WAVE_CYCLE and len(entry["frames"]) == 2
+    assert manifest["sources"]["gfs"]["release"] == CYCLE
+    for field in ("wave_height.sfc", "wave_period.sfc"):
+        assert len(list((out / "gfswave" / WAVE_CYCLE / field).rglob("*.wxt"))) == 108
+    assert not (work / "child").exists()
+    printed = capsys.readouterr().out
+    assert "::error::" not in printed and "gfswave child: " in printed
+    assert f"- gfswave {WAVE_CYCLE}: 2 frames, 2 fields" in (tmp / "summary.md").read_text(encoding="utf-8")

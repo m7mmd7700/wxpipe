@@ -92,9 +92,97 @@ def test_both_parts_list_the_same_sources():
     assert check.source.INFOS is source.INFOS
     assert source.info("gfs").last_hour == config.GFS.forecast_hours[-1]
     assert source.info("ifs").last_hour == config.IFS.forecast_hours[-1]
-    # A3: GFS, then IFS, in both parts.
-    assert source.INFOS == (source.GFS, source.IFS) and config.SOURCES == (config.GFS, config.IFS)
+    # A3: GFS, then GFS-Wave, then IFS, in both parts.
+    assert source.INFOS == (source.GFS, source.GFSWAVE, source.IFS)
+    assert config.SOURCES == (config.GFS, config.GFSWAVE, config.IFS)
     assert config.IFS.info is source.IFS and config.source("ifs") is config.IFS
+    assert config.GFSWAVE.info is source.GFSWAVE and config.source("gfswave") is config.GFSWAVE
+    assert source.info("gfswave") is source.GFSWAVE
+    assert source.info("gfswave").last_hour == config.GFSWAVE.forecast_hours[-1]
+
+
+# ---- GFS-Wave ----------------------------------------------------------------------------------
+
+def test_gfswave_urls():
+    # A1: findings W1's path for a 00, a 12 and an 18 cycle at hours 0 and 384.
+    root = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+    for cycle, day, hh in ((datetime(2026, 11, 24, 0, tzinfo=timezone.utc), "20261124", "00"),
+                           (datetime(2026, 11, 24, 12, tzinfo=timezone.utc), "20261124", "12"),
+                           (datetime(2026, 11, 22, 18, tzinfo=timezone.utc), "20261122", "18")):
+        for hour in (0, 384):
+            stem = f"{root}/gfs.{day}/{hh}/wave/gridded/gfswave.t{hh}z.global.0p25.f{hour:03d}.grib2"
+            assert source.file_url(source.GFSWAVE, cycle, hour) == stem
+            assert source.idx_url(source.GFSWAVE, cycle, hour) == stem + ".idx"
+    assert source.file_url(source.GFSWAVE, datetime(2026, 11, 24, 12, tzinfo=timezone.utc), 0) == (
+        "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20261124/12/wave/gridded/gfswave.t12z.global.0p25.f000.grib2")
+    assert source.GFSWAVE.file_suffix == "" and source.GFSWAVE.copies == ()
+    assert source.roots(source.GFSWAVE) == (source.GFS.base_url,)
+    # GFS's URLs are today's.
+    assert source.file_url(source.GFS, CYCLE, 7) == (
+        "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20261107/12/atmos/gfs.t12z.pgrb2.0p25.f007")
+
+
+def test_gfswave_newest_complete_cycle():
+    # A2: 6-hourly, by f384's index, six cycles back, none when none exists.
+    now = datetime(2026, 11, 24, 15, 41, tzinfo=timezone.utc)   # the newest 6-hourly cycle is 2026112412
+    asked = []
+
+    def exists_from(published):
+        def exists(url):
+            asked.append(url)
+            return url in published
+        return exists
+
+    def idx(day, hour):
+        return source.idx_url(source.GFSWAVE, datetime(2026, 11, day, hour, tzinfo=timezone.utc), 384)
+
+    assert source.latest_complete_cycle(source.GFSWAVE, now, exists_from({idx(24, 6), idx(24, 0)})) == datetime(
+        2026, 11, 24, 6, tzinfo=timezone.utc)
+    assert asked == [idx(24, 12), idx(24, 6)]
+    assert all("/wave/gridded/gfswave." in url and url.endswith(".global.0p25.f384.grib2.idx") for url in asked)
+    asked.clear()
+    oldest = idx(23, 6)   # six cycles back: 24 12, 24 06, 24 00, 23 18, 23 12, 23 06
+    assert source.latest_complete_cycle(source.GFSWAVE, now, exists_from({oldest})) == datetime(
+        2026, 11, 23, 6, tzinfo=timezone.utc)
+    assert source.latest_complete_cycle(source.GFSWAVE, now, exists_from({idx(23, 0)})) is None
+    assert source.latest_complete_cycle(source.GFSWAVE, now, exists_from(set())) is None
+    assert len(asked) == 6 + 6 + 6
+
+
+def test_gfswave_description_holds_its_values():
+    # A3.
+    s = config.GFSWAVE
+    assert (s.info.name, s.info.last_hour, s.info.cycle_hours, s.info.lookback_cycles) == ("gfswave", 384, 6, 6)
+    assert (s.info.base_url, s.info.idx_suffix) == ("https://noaa-gfs-bdp-pds.s3.amazonaws.com", ".idx")
+    assert s.forecast_hours == config.GFS.forecast_hours and len(s.forecast_hours) == 209
+    assert s.grid == config.GFS.grid == config.Grid(1440, 721, 90.0, 0.0, 0.25, 0.25, 0, 0)
+    assert [(f.name, f.units, f.grib, f.kind, f.scale, f.offset) for f in s.fields] == [
+        ("wave_height.sfc", "m", "HTSGW:surface", "instant", 1.0, 0.0),
+        ("wave_period.sfc", "s", "PERPW:surface", "instant", 1.0, 0.0),
+    ]
+    assert [f.lut.breakpoints for f in s.fields] == [
+        ((0, 0.0), (200, 10.0), (254, 20.0)),
+        ((0, 0.0), (200, 20.0), (254, 30.0)),
+    ]
+    assert s.field("wave_height.sfc").lut is config.WAVE_HEIGHT_LUT
+    assert s.field("wave_period.sfc").lut is config.WAVE_PERIOD_LUT
+    assert (s.parse_idx, s.instant_record, s.accumulation_records, s.read) == (
+        gfs.parse_idx, gfs.instant_record, gfs.accumulation_records, gfs.read_checked)
+    assert s.workers is None and s.read_limit_seconds == 900 and not s.cache_one_cycle
+    assert s.probes == (config.Probe("gfswave-htsgw-jpeg.grib2", 0.0, 8.27, 2.267598, missing=468208),)
+    assert s.attribution_parts is None and s.reads_reset is None and s.reads_report is None
+    assert s.attribution == ("NOAA NCEP GFS-Wave, the global 0.25 degree wave model of the Global Forecast "
+                             "System. Public domain.")
+    # F1: only GFS-Wave's job runs in a child process in the workflow's form, bound by 20 minutes.
+    assert [(x.name, x.child_seconds) for x in config.SOURCES] == [("gfs", None), ("gfswave", 1200), ("ifs", None)]
+    # Only IFS waits for GFS.
+    assert [(x.name, x.waits_for_gfs) for x in config.SOURCES] == [("gfs", False), ("gfswave", False), ("ifs", True)]
+    # IFS's probes record no missing count.
+    assert all(p.missing is None for p in config.IFS.probes)
+    # The sample's grid (brief §3.4 S3) passes; IFS's 180E start does not.
+    grib.check_grid(config.GFSWAVE, **GOOD)
+    with pytest.raises(ValueError, match="unexpected gfswave grid: longitudeOfFirstGridPointInDegrees 180.0"):
+        grib.check_grid(config.GFSWAVE, **dict(GOOD, lon0=180.0))
 
 
 # ---- IFS -------------------------------------------------------------------------------------
