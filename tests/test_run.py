@@ -1876,3 +1876,110 @@ def test_a_real_child_builds_gfswave_from_its_cache(no_requests, monkeypatch, ca
     printed = capsys.readouterr().out
     assert "::error::" not in printed and "gfswave child: " in printed
     assert f"- gfswave {WAVE_CYCLE}: 2 frames, 2 fields" in (tmp / "summary.md").read_text(encoding="utf-8")
+
+
+# ---- the gust: alternates and frame 0 from the next frame (M6 S16, D1 and D2) ----------------------
+
+def ifs_gust_index(hours, as_hour=None, to_10fg3=()):
+    """IFS's fixture records by hour. With [as_hour], hour h holds the f150 fixture's records restamped
+    to step h; the steps in [to_10fg3] hold `10fg3` in place of `10fg`."""
+    out = {}
+    for h in hours:
+        fixture = 150 if as_hour else h
+        text = (FIXTURES / "ifs" / f"ifs-f{fixture:03d}.index").read_text(encoding="utf-8")
+        if as_hour:
+            text = text.replace('"step": "150"', f'"step": "{h}"')
+        if h in to_10fg3:
+            text = text.replace('"param": "10fg"', '"param": "10fg3"')
+        out[h] = ecmwf.parse_idx(text)
+    return out
+
+
+class GustFetcher:
+    """A fetcher whose message of hour h is the text of h / 2, read by the fake decode below; every
+    (hour, record) asked is kept."""
+
+    def __init__(self):
+        self.asked = []
+
+    def messages(self, items):
+        self.asked.extend(items)
+        return {(h, r.number): str(h / 2).encode("ascii") for h, r in items}
+
+
+@pytest.fixture
+def gust_decode(monkeypatch):
+    monkeypatch.setattr(grib, "decode", lambda message, src: np.full((config.NY, config.NX), float(message)))
+
+
+def test_the_gust_is_a_gap_where_neither_its_key_nor_an_alternate_is_present():
+    # A16: GFS's gust needs its record at every hour, hour 0's `anl` included.
+    assert run.gaps(config.GFS, index(), HOURS, "bucket") == []
+    idx = index(drop={(6, "GUST:surface", "6 hour fcst")})
+    assert run.gaps(config.GFS, idx, HOURS, "bucket") == [("wind_gust.sfc", 6)]
+    idx = index(drop={(0, "GUST:surface", "anl")})
+    assert run.gaps(config.GFS, idx, HOURS, "bucket") == [("wind_gust.sfc", 0)]
+    # IFS's: 10fg, else 10fg3; with neither, a gap; hour 0 never asked, so never a gap.
+    assert run.gaps(config.IFS, ifs_index(), IFS_HOURS, "bucket") == []
+    assert run.gaps(config.IFS, ifs_index({("150", "10fg")}), IFS_HOURS, "bucket") == [("wind_gust.sfc", 150)]
+    assert run.gaps(config.IFS, ifs_index({("0", "10fg")}), IFS_HOURS, "bucket") == []
+    gust = config.IFS.field("wind_gust.sfc")
+    moved = ifs_gust_index(IFS_HOURS, to_10fg3=(150,))
+    assert run.gaps(config.IFS, moved, IFS_HOURS, "bucket") == []
+    record = run.instant_record(config.IFS, gust, moved[150], 150)
+    assert record.key == "10fg3:sfc" and record.step == "150"
+    assert run.instant_record(config.IFS, gust, ifs_index()[150], 150).key == "10fg:sfc"
+    assert run.instant_record(config.IFS, gust, ifs_index({("150", "10fg")})[150], 150) is None
+    # Both keys at one step: `grib`'s record is taken, the alternate only where it is absent (the review's V3).
+    text = (FIXTURES / "ifs" / "ifs-f150.index").read_text(encoding="utf-8")
+    line = next(x for x in text.splitlines() if '"param": "10fg"' in x)
+    both = ecmwf.parse_idx(text.rstrip("\n") + "\n" + line.replace('"param": "10fg"', '"param": "10fg3"') + "\n")
+    assert sum(r.key in ("10fg:sfc", "10fg3:sfc") for r in both) == 2
+    assert run.instant_record(config.IFS, gust, both, 150).key == "10fg:sfc"
+
+
+def test_ifs_gust_frame_0_is_frame_1_and_hour_0_is_never_read(gust_decode):
+    # A16: over (0, 150, 360) no record of hour 0 is asked, and frame 0's bytes equal frame 1's.
+    gust = config.IFS.field("wind_gust.sfc")
+    cycle = run.parse_cycle(IFS_CYCLE)
+    fetcher = GustFetcher()
+    frames = run.build_instant(config.IFS, gust, cycle, IFS_HOURS, ifs_index(), fetcher)
+    assert sorted(h for h, _ in fetcher.asked) == [150, 360]
+    assert [t for t, _ in frames] == [run.valid_time(cycle, h) for h in IFS_HOURS]
+    assert np.array_equal(frames[0][1], frames[1][1]) and frames[0][1] is not frames[1][1]
+    assert np.all(frames[1][1] == gust.lut.encode(75.0)) and np.all(frames[2][1] == gust.lut.encode(180.0))
+    assert not np.array_equal(frames[1][1], frames[2][1])
+    # Hour 0 alone: nothing read, and the frame stays missing.
+    fetcher = GustFetcher()
+    alone = run.build_instant(config.IFS, gust, cycle, (0,), ifs_index(), fetcher)
+    assert fetcher.asked == [] and len(alone) == 1 and np.all(alone[0][1] == gust.lut.encode(np.nan))
+    # A job without hour 0 reads every hour's own record, 10fg3 where 10fg is absent.
+    fetcher = GustFetcher()
+    own = run.build_instant(config.IFS, gust, cycle, (3, 6), ifs_gust_index((3, 6), as_hour=True, to_10fg3=(6,)), fetcher)
+    assert [(h, r.key) for h, r in fetcher.asked] == [(3, "10fg:sfc"), (6, "10fg3:sfc")]
+    assert np.all(own[0][1] == gust.lut.encode(1.5)) and np.all(own[1][1] == gust.lut.encode(3.0))
+    assert not np.array_equal(own[0][1], own[1][1])
+
+
+def test_gfs_gust_reads_its_own_record_at_hour_0(gust_decode):
+    # A16: "own", today's behaviour, by GFS's gust at hour 0 from its `anl` record.
+    gust = config.GFS.field("wind_gust.sfc")
+    fetcher = GustFetcher()
+    frames = run.build_instant(config.GFS, gust, run.parse_cycle(CYCLE), (0, 6), index((0, 6)), fetcher)
+    assert [(h, r.number, r.fcst) for h, r in fetcher.asked] == [(0, 14, "anl"), (6, 14, "6 hour fcst")]
+    assert np.all(frames[0][1] == gust.lut.encode(0.0)) and np.all(frames[1][1] == gust.lut.encode(3.0))
+
+
+@pytest.mark.parametrize("src, cycle, hours", [(config.GFS, CYCLE, (0, 1)), (config.IFS, IFS_CYCLE, IFS_HOURS)],
+                         ids=["gfs", "ifs"])
+def test_the_entry_lists_the_gust_last_and_every_other_field_as_before(src, cycle, hours):
+    # A17.
+    entry = run.release_entry(src, run.parse_cycle(cycle), hours, src.fields)
+    six = run.release_entry(src, run.parse_cycle(cycle), hours, src.fields[:6])
+    assert list(entry["fields"]) == list(six["fields"]) + ["wind_gust.sfc"]
+    assert entry["fields"]["wind_gust.sfc"] == {"units": "m s**-1", "values": config.GUST_LUT.header()}
+    # The user's table after round 1 (the fix round's F10).
+    assert config.GUST_LUT.header() == {"scale": "lin", "breakpoints": [[0, 0.0], [120, 60.0], [140, 80.0]], "missing": 255}
+    assert {k: v for k, v in entry["fields"].items() if k != "wind_gust.sfc"} == six["fields"]
+    assert list(entry) == list(six) and {k: v for k, v in entry.items() if k != "fields"} == {
+        k: v for k, v in six.items() if k != "fields"}

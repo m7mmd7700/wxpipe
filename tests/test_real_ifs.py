@@ -134,7 +134,9 @@ def daytime_hour() -> int:
     return next(h for h in SAMPLE_HOURS if 6 <= (run_hour + h) % 24 <= 12)
 
 
-INSTANT = [f.name for f in config.IFS.fields if f.kind == "instant"]
+# The instant fields that read their own record at every step: the two tests below build the daytime step
+# alone, step 0 for the 12 UTC run, which the gust never reads (M6 S16, D2); the gust's own tests follow.
+INSTANT = [f.name for f in config.IFS.fields if f.kind == "instant" and f.first_frame == "own"]
 
 
 @pytest.mark.parametrize("name", INSTANT)
@@ -180,6 +182,65 @@ def test_the_rate_is_the_difference_of_the_totals(interval, tmp_path):
     if interval == (3, 6):
         # The largest 3-hour rate on the globe is a plausible one, so the scale is mm, not m.
         assert 1.0 < float(expected.max()) < 300.0
+
+
+class RecordingFetcher(Fetcher):
+    """The sample's fetcher, keeping every (hour, record) whose message the build asks for."""
+
+    def __init__(self):
+        super().__init__(config.IFS, parse_cycle(CYCLE), ROOT / "work")
+        self.asked = []
+
+    def messages(self, items):
+        self.asked.extend(items)
+        return super().messages(items)
+
+
+@pytest.mark.parametrize("h, key", [(3, "10fg:sfc"), (144, "10fg3:sfc"), (360, "10fg:sfc")])
+def test_gust_tiles_equal_the_raw_message_at_every_level_and_the_orientation(h, key, tmp_path):
+    # M6 S16, A19: the gust in m/s as delivered, its record found by the build's own rule, grib then
+    # alternates; step 144 holds 10fg3 alone. Every level within half a table step, then Riyadh and a
+    # point east of 180 against ecCodes' nearest point.
+    from wxpipe import run
+
+    field = config.IFS.field("wind_gust.sfc")
+    idx = index((h,))
+    record = run.instant_record(config.IFS, field, idx[h], h)
+    assert record.key == key and record.step == str(h)
+    message = (SAMPLE / f"f{h:03d}" / f"{record.number}.grib2").read_bytes()
+    expected = raw_on_shared_grid(message)
+    frames = build_instant(config.IFS, field, parse_cycle(CYCLE), (h,), idx, fetcher())
+    write_field(tmp_path, config.IFS, field, CYCLE, frames)
+    checked = 0
+    for level in config.LEVELS:
+        for tile in tiles.tiles_for(level):
+            header, decoded = wxt.read(tmp_path / field.name / tile.size.path / f"{tile.path}.wxt")
+            assert header["source"] == "ifs" and header["values"] == config.GUST_LUT.header()
+            values = field.lut.decode(decoded[0][1])
+            want = tile.cut(expected)
+            inside = (want >= field.lut.min_value) & (want <= field.lut.max_value)
+            steps = np.vectorize(field.lut.step)(want[inside])
+            assert np.all(np.abs(values[inside] - want[inside]) <= steps / 2 + 1e-6)
+            checked += int(inside.sum())
+    assert checked > 100_000
+    for lat, lon in (RIYADH, PACIFIC):
+        near_lat, near_lon, want = nearest(message, lat, lon)
+        got = tile_value(tmp_path, field, *cell(near_lat, near_lon))
+        assert abs(got - want) <= field.lut.step(want) / 2 + 1e-6, (lat, lon, got, want)
+
+
+def test_gust_frame_0_is_frame_1_and_step_0_is_never_read():
+    # M6 S16, A19: a build of the nine steps; step 0's constant message is not asked.
+    field = config.IFS.field("wind_gust.sfc")
+    recording = RecordingFetcher()
+    frames = build_instant(config.IFS, field, parse_cycle(CYCLE), SAMPLE_HOURS, index(SAMPLE_HOURS), recording)
+    assert sorted(h for h, _ in recording.asked) == list(SAMPLE_HOURS[1:])
+    assert frames[0][1].tobytes() == frames[1][1].tobytes()
+    assert (frames[1][1] != 255).any(), "frame 1 holds values, so frame 0's copy is no missing frame"
+    # Frame 0 keeps the run's own time, three hours before frame 1's (the review's W2).
+    run_time = int(parse_cycle(CYCLE).timestamp())
+    assert frames[0][0] == run_time and frames[1][0] == run_time + 3 * 3600
+    assert len(frames) == len(SAMPLE_HOURS)
 
 
 def packing_step_mm(message: bytes) -> float:

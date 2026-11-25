@@ -19,11 +19,13 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # A GFS run takes 2 to 4 minutes; a run that builds GFS defers ECMWF to the next run. An ECMWF run
-    # is longer: its probe, index reads and message reads share one 45-minute limit, each read checked
-    # before it starts, so a read in progress can overrun it by its own retries, up to about 16 minutes.
-    # 180 leaves room for a run that builds every source after a lost cache. A job's timeout cannot
-    # read a step's output, so it is 180 in every run.
+    # A run that builds GFS also builds GFS-Wave in its child, at most 20 minutes, and defers ECMWF to
+    # the next run: its build job took 3 min 49 s in run 45520423826, and the gust adds about 19 s.
+    # An ECMWF run is longer: its probe, index reads and message reads share one 45-minute limit, each
+    # read checked before it starts, so a read in progress can overrun it by its own retries, up to
+    # 825 s, about 14 minutes, or about 21 minutes when every wait is a Retry-After of 60 s. 180 leaves
+    # room for a run that builds every source after a lost cache. A job's timeout cannot read a step's
+    # output, so it is 180 in every run.
     timeout-minutes: 180
     outputs:
       published: ${{ steps.run.outputs.published }}

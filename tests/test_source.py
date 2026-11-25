@@ -65,7 +65,10 @@ def test_gfs_description_holds_todays_values():
         ("wind_v.10m", "VGRD:10 m above ground", "instant"),
         ("pressure.msl", "PRMSL:mean sea level", "instant"),
         ("cloud.total", "TCDC:entire atmosphere", "instant"),
+        ("wind_gust.sfc", "GUST:surface", "instant"),
     ]
+    # The gust (M6 S16, D1): no alternates, its own record at hour 0.
+    assert [(f.alternates, f.first_frame) for f in s.fields] == [((), "own")] * 7
     tables = {f.name: (f.lut.breakpoints, f.units, f.scale, f.offset) for f in s.fields}
     assert tables == {
         "temperature.2m": (((0, -70.0), (20, -30.0), (230, 50.0), (254, 60.0)), "C", 1.0, -273.15),
@@ -74,7 +77,9 @@ def test_gfs_description_holds_todays_values():
         "wind_v.10m": (((0, -80.0), (20, -40.0), (234, 40.0), (254, 80.0)), "m s**-1", 1.0, 0.0),
         "pressure.msl": (((0, 870.0), (20, 950.0), (234, 1050.0), (254, 1090.0)), "hPa", 0.01, 0.0),
         "cloud.total": (((0, 0.0), (254, 100.0)), "%", 1.0, 0.0),
+        "wind_gust.sfc": (((0, 0.0), (120, 60.0), (140, 80.0)), "m s**-1", 1.0, 0.0),
     }
+    assert config.GFS.field("wind_gust.sfc").lut is config.GUST_LUT
     assert s.grid == config.Grid(1440, 721, 90.0, 0.0, 0.25, 0.25, 0, 0)
     assert (config.NX, config.NY, config.LAT0, config.LON0, config.DEG) == (1440, 721, 90.0, 0.0, 0.25)
     assert s.attribution == "NOAA NCEP Global Forecast System (GFS). Public domain."
@@ -408,7 +413,11 @@ def test_ifs_description_holds_its_values():
         ("wind_v.10m", "10v:sfc", "instant"),
         ("pressure.msl", "msl:sfc", "instant"),
         ("cloud.total", "tcc:sfc", "instant"),
+        ("wind_gust.sfc", "10fg:sfc", "instant"),
     ]
+    # The gust (M6 S16, D1 and D2): 10fg3 where 10fg is absent, and frame 0 from frame 1.
+    assert [(f.alternates, f.first_frame) for f in s.fields] == [((), "own")] * 6 + [(("10fg3:sfc",), "next")]
+    assert s.field("wind_gust.sfc").lut is config.GUST_LUT
     # GFS's names, units and tables; each field's scale and offset from the sample's units (K, m, m/s, Pa, 0-1).
     assert [(f.name, f.units, f.lut.breakpoints) for f in s.fields] == [
         (f.name, f.units, f.lut.breakpoints) for f in config.GFS.fields]
@@ -419,6 +428,7 @@ def test_ifs_description_holds_its_values():
         "wind_v.10m": (1.0, 0.0),
         "pressure.msl": (0.01, 0.0),
         "cloud.total": (100.0, 0.0),
+        "wind_gust.sfc": (1.0, 0.0),
     }
     assert s.grid == config.Grid(1440, 721, 90.0, 180.0, 0.25, 0.25, 0, 0)
     assert (s.parse_idx, s.instant_record, s.accumulation_records, s.read) == (
@@ -478,3 +488,22 @@ def test_check_grid_names_every_differing_value():
     with pytest.raises(ValueError) as e:
         grib.check_grid(config.GFS, **dict(GOOD, ni=1439, lon0=180.0))
     assert "Ni 1439" in str(e.value) and "longitudeOfFirstGridPointInDegrees 180.0" in str(e.value)
+
+
+def test_only_an_instant_field_takes_alternates_or_its_frame_0_from_the_next():
+    # M6 S16, D2 and A15: refused where the source is described, and no source's field breaks it.
+    for src in config.SOURCES:
+        for f in src.fields:
+            assert f.first_frame in ("own", "next"), (src.name, f.name)
+            if f.kind != "instant":
+                assert f.alternates == () and f.first_frame == "own", (src.name, f.name)
+    rain = config.IFS.field("precipitation.sfc")
+    with pytest.raises(ValueError, match="instant field only"):
+        config.Field(rain.name, rain.units, rain.grib, rain.lut, kind="precip_rate", alternates=("tp3:sfc",))
+    with pytest.raises(ValueError, match="instant field only"):
+        config.Field(rain.name, rain.units, rain.grib, rain.lut, kind="precip_rate", first_frame="next")
+    with pytest.raises(ValueError, match="first_frame"):
+        config.Field("wind_gust.sfc", "m s**-1", "10fg:sfc", config.GUST_LUT, first_frame="first")
+    # GFS-Wave's two fields are as S15 left them.
+    assert [(f.name, f.alternates, f.first_frame) for f in config.GFSWAVE.fields] == [
+        ("wave_height.sfc", (), "own"), ("wave_period.sfc", (), "own")]

@@ -150,9 +150,10 @@ def gaps(src: config.Source, idx: dict, hours, method: str, fields=None) -> list
     """Every (field name, frame hour) for which the index records lack what the frame needs, where the
     build would otherwise write a frame of missing bytes. Extra, reordered or repeated records are not gaps.
 
-    An instant field needs its record at the hour. Precipitation needs, for each interval (prev, now],
-    the accumulation window that `precip.rate` would take with [method], and the earlier window it
-    subtracts; the first frame has no interval.
+    An instant field needs its record at the hour, its `grib` key's or an alternate's (`instant_record`);
+    one whose `first_frame` is "next" needs none at hour 0, which it never reads. Precipitation needs,
+    for each interval (prev, now], the accumulation window that `precip.rate` would take with [method],
+    and the earlier window it subtracts; the first frame has no interval.
     """
     out = []
     for field in (src.fields if fields is None else fields):
@@ -166,12 +167,32 @@ def gaps(src: config.Source, idx: dict, hours, method: str, fields=None) -> list
                         out.append((field.name, h))
                 prev, prev_keys = h, keys
         else:
-            out.extend((field.name, h) for h in hours if src.instant_record(idx[h], field.grib, h) is None)
+            out.extend((field.name, h) for h in hours
+                       if not _skips_hour(field, h) and instant_record(src, field, idx[h], h) is None)
     return out
 
 
+def instant_record(src: config.Source, field: config.Field, records, h: int):
+    """An instant field's record at hour [h]: its `grib` key's, else the first of its `alternates` present
+    at the hour, through the source's own `instant_record`; None when none is."""
+    for key in (field.grib, *field.alternates):
+        record = src.instant_record(records, key, h)
+        if record is not None:
+            return record
+    return None
+
+
+def _skips_hour(field: config.Field, h: int) -> bool:
+    """A field whose `first_frame` is "next" never reads hour 0's record."""
+    return field.first_frame == "next" and h == 0
+
+
 def build_instant(src: config.Source, field: config.Field, cycle, hours, idx, fetcher) -> list[tuple[int, np.ndarray]]:
-    records = {h: src.instant_record(idx[h], field.grib, h) for h in hours}
+    """An instant field's frames, each hour from its own record (`instant_record`), a missing record
+    giving a frame of missing bytes. With `first_frame` "next", hour 0's record is never read: when the
+    hours begin at 0 and hold two or more, frame 0 takes frame 1's bytes, as `build_precip`'s frame 0
+    does; with hour 0 alone it stays missing."""
+    records = {h: None if _skips_hour(field, h) else instant_record(src, field, idx[h], h) for h in hours}
     data = fetcher.messages([(h, r) for h, r in records.items() if r is not None])
     frames = []
     for h in hours:
@@ -181,6 +202,8 @@ def build_instant(src: config.Source, field: config.Field, cycle, hours, idx, fe
         else:
             grid = grib.decode(data[(h, r.number)], src) * field.scale + field.offset
         frames.append((valid_time(cycle, h), field.lut.encode(grid)))
+    if field.first_frame == "next" and len(frames) > 1 and hours[0] == 0:
+        frames[0] = (frames[0][0], frames[1][1].copy())
     return frames
 
 

@@ -2,7 +2,8 @@
 
 A source is described in two parts. Its standard-library part, `wxpipe.source.SourceInfo`, holds what
 the cheap check needs: name, last hour, cycle step and run discovery. Its full part, `Source` here,
-adds the grid as delivered, the forecast hours, the fields with their tables, the fetch functions, the
+adds the grid as delivered, the forecast hours, the fields with their tables and, for an instant field,
+its alternate keys and its rule for frame 0 (`Field.alternates`, `Field.first_frame`), the fetch functions, the
 attribution, and how the source is read: its workers, its read time limit, its cache, its probe
 messages, whether a run that builds GFS defers it, and whether its job runs in a child process. The rationale for each choice is in docs/DESIGN.md.
 """
@@ -48,6 +49,19 @@ class Field:
     kind: str = "instant"     # "instant", or "precip_rate" (rate from accumulations)
     scale: float = 1.0        # stored value = raw * scale + offset
     offset: float = 0.0
+    # Keys tried in order at an hour where [grib]'s record is absent; an instant field's only.
+    alternates: tuple[str, ...] = ()
+    # "own": every hour reads its own record. "next": the record at hour 0 is never read and hour 0 is
+    # no gap; when the job's hours begin at 0 and hold two or more, frame 0 takes the next frame's bytes,
+    # as the rain's frame 0 does; with hour 0 alone it stays missing. For a field whose hour-0 record
+    # holds nothing, such as ECMWF's maximum gust. An instant field's only.
+    first_frame: str = "own"
+
+    def __post_init__(self) -> None:
+        if self.first_frame not in ("own", "next"):
+            raise ValueError(f"{self.name}: first_frame must be 'own' or 'next', not {self.first_frame!r}")
+        if self.kind != "instant" and (self.alternates or self.first_frame != "own"):
+            raise ValueError(f"{self.name}: alternates and first_frame 'next' are for an instant field only")
 
 
 @dataclass(frozen=True)
@@ -140,6 +154,12 @@ CLOUD_LUT = Lut([(0, 0.0), (254, 100.0)])
 # above. The sample run 2026112412's largest values were 11.98 m and 26.64 s.
 WAVE_HEIGHT_LUT = Lut([(0, 0.0), (200, 10.0), (254, 20.0)])
 WAVE_PERIOD_LUT = Lut([(0, 0.0), (200, 20.0), (254, 30.0)])
+# The wind gust's, GFS's and ECMWF's: 0.5 m/s a byte to 60 m/s and 1 m/s a byte above to 80 m/s. The user
+# chose it after round 1's table, 0.2 m/s a byte, which projected the site at 890.0 MB, 10.0 MB under the gate;
+# with this one about 838.6 MB, 61.4 MB under it. The largest decode error over the samples was 0.22 m/s for
+# GFS and 0.24 m/s for ECMWF; the sample runs' largest values were 38.72 m/s for GFS (2026110712) and
+# 45.05 m/s for ECMWF (2026112312).
+GUST_LUT = Lut([(0, 0.0), (120, 60.0), (140, 80.0)])
 
 GFS = Source(
     info=source_info.GFS,
@@ -155,6 +175,8 @@ GFS = Source(
         Field("wind_v.10m", "m s**-1", "VGRD:10 m above ground", WIND_LUT),
         Field("pressure.msl", "hPa", "PRMSL:mean sea level", PRESSURE_LUT, scale=0.01),
         Field("cloud.total", "%", "TCDC:entire atmosphere", CLOUD_LUT),
+        # The surface gust, instant: `anl` at hour 0, `N hour fcst` after it, as the other fields.
+        Field("wind_gust.sfc", "m s**-1", "GUST:surface", GUST_LUT),
     ),
     parse_idx=gfs.parse_idx,
     instant_record=gfs.instant_record,
@@ -192,6 +214,10 @@ IFS = Source(
         Field("wind_v.10m", "m s**-1", "10v:sfc", WIND_LUT),
         Field("pressure.msl", "hPa", "msl:sfc", PRESSURE_LUT, scale=0.01),             # Pa
         Field("cloud.total", "%", "tcc:sfc", CLOUD_LUT, scale=100.0),                   # 0 to 1
+        # The 10 m gust, the maximum over the interval before the step: 1 h to 144 h, 6 h after it, and at
+        # a step where `10fg` is absent `10fg3`, over 3 h (step 144 in the sample run). Step 0's message
+        # is a constant 0 that no maximum fills, so frame 0 takes frame 1's bytes.
+        Field("wind_gust.sfc", "m s**-1", "10fg:sfc", GUST_LUT, alternates=("10fg3:sfc",), first_frame="next"),
     ),
     parse_idx=ecmwf.parse_idx,
     instant_record=ecmwf.instant_record,
