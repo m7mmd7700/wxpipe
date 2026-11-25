@@ -356,11 +356,12 @@ IFS_ATTRIBUTION_2026 = (
     "https://creativecommons.org/licenses/by/4.0/ "
     "© 2026 European Centre for Medium-Range Weather Forecasts (ECMWF) "
     "Source www.ecmwf.int "
-    "Based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF). "
+    "This data is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF). "
     "ECMWF does not accept any liability whatsoever for any error or omission in the data, their availability, "
     "or for any loss or damage arising from their use. "
     "Modified: the columns rolled to start at 0°E, units converted, accumulated precipitation turned into "
-    "rates, values quantised to 8-bit tables and cut into map tiles."
+    "rates, the first hour of precipitation and of gusts filled from the next step, at one step a 3-hour gust "
+    "used for the 1-hour one, values quantised to 8-bit tables and cut into map tiles."
 )
 
 
